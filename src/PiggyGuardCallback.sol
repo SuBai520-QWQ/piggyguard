@@ -19,7 +19,9 @@ import { PiggyVault } from "./PiggyVault.sol";
 ///      depositTo (see plan R4). Deploy order (plan §2.2): reactive first,
 ///      then this contract, then setCallback() backfills the address.
 contract PiggyGuardCallback is AbstractCallback {
-    event ActionReceived(string action, address indexed reactiveSender, uint256 price);
+    event ActionReceived(
+        string action, address indexed reactiveSender, uint256 price, uint256 actionId
+    );
 
     PiggyVault public immutable vault;
 
@@ -31,29 +33,33 @@ contract PiggyGuardCallback is AbstractCallback {
     }
 
     /// @notice Stop-loss: sell the whole risk position at the trigger price.
-    function executeStopLoss(address sender, uint256 price)
+    function executeStopLoss(address sender, uint256 price, uint256 actionId)
         external
         onlyServiceProvider
         onlyCallbackSender(sender)
     {
-        emit ActionReceived("stopLoss", sender, price);
-        vault.executeStopLoss(price);
+        emit ActionReceived("stopLoss", sender, price, actionId);
+        vault.executeStopLoss(price, actionId);
     }
 
     /// @notice Take-profit: sell half the risk position at the trigger price.
-    function executeTakeProfit(address sender, uint256 price)
+    function executeTakeProfit(address sender, uint256 price, uint256 actionId)
         external
         onlyServiceProvider
         onlyCallbackSender(sender)
     {
-        emit ActionReceived("takeProfit", sender, price);
-        vault.executeTakeProfit(price);
+        emit ActionReceived("takeProfit", sender, price, actionId);
+        vault.executeTakeProfit(price, actionId);
     }
 
     /// @notice DCA tick: buy the risk asset with the vault's fixed DCA amount.
     ///         The vault reads the price from the feed itself.
-    function executeDCA(address sender) external onlyServiceProvider onlyCallbackSender(sender) {
-        emit ActionReceived("dca", sender, 0);
-        vault.executeDCA();
+    function executeDCA(address sender, uint256 actionId)
+        external
+        onlyServiceProvider
+        onlyCallbackSender(sender)
+    {
+        emit ActionReceived("dca", sender, 0, actionId);
+        vault.executeDCA(actionId);
     }
 }

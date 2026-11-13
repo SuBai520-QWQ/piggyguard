@@ -4,6 +4,7 @@ pragma solidity ^0.8.29;
 import { ISystemContract } from "@reactive/src/interfaces/ISystemContract.sol";
 import { IReactive } from "@reactive/src/interfaces/IReactive.sol";
 import { AbstractReactive } from "@reactive/src/base/AbstractReactive.sol";
+import { PiggyGuardCallback } from "./PiggyGuardCallback.sol";
 
 /// @title PiggyGuardReactive — Lasna reactive contract (Omni).
 /// @notice Watches two event streams and orders the vault's three automated
@@ -13,10 +14,16 @@ import { AbstractReactive } from "@reactive/src/base/AbstractReactive.sol";
 ///            orders a take-profit sell. Each crossing fires at most once
 ///            (latched until the price returns inside the band), so a price
 ///            that stays below the line does not spam callbacks.
-///         2. Cron100 ticks on Lasna — each tick orders one DCA buy.
+///         2. Cron100 ticks on Lasna — each tick orders one DCA buy. While a
+///            stop-loss or take-profit latch is set the position is in exit
+///            mode, so DCA requests are suppressed until the price is back
+///            inside the band.
 ///         Non-matching logs are ignored silently; react() never reverts on
 ///         purpose, because the network bills reverted reactions anyway
 ///         (official docs) and a revert must never be used as a filter.
+///         Every callback carries a monotonically increasing actionId; the
+///         vault executes only ids above the last one it saw, so a replayed or
+///         out-of-order callback is ignored on the destination chain.
 /// @dev Omni migration notes (verified against the official basic demo loop,
 ///      stage2 §8.7 — Sepolia event -> Lasna react() -> Sepolia callback):
 ///      - SYSTEM = 0x8888888888888888888888888888888888888888, react() guarded
@@ -51,6 +58,7 @@ contract PiggyGuardReactive is AbstractReactive {
 
     error NotOwner(address sender);
     error ZeroAddress();
+    error InvalidThresholds(uint256 stopLoss, uint256 takeProfit);
 
     address public immutable owner;
     address public immutable priceFeed;
@@ -64,9 +72,14 @@ contract PiggyGuardReactive is AbstractReactive {
     bool public dcaEnabled = true;
 
     /// @notice Latches: one callback per crossing; cleared when the price
-    ///         returns inside the (stopLoss, takeProfit) band.
+    ///         returns inside the (stopLoss, takeProfit) band, or when the
+    ///         owner changes the thresholds.
     bool public stopLossLatched;
     bool public takeProfitLatched;
+
+    /// @notice Id handed to the next callback. Shared by all three actions so
+    ///         the vault can reject duplicates and out-of-order deliveries.
+    uint256 public actionCounter;
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner(msg.sender);
@@ -106,9 +119,15 @@ contract PiggyGuardReactive is AbstractReactive {
         emit CallbackUpdated(callback_);
     }
 
+    /// @notice Update the band. Rejects an inverted or degenerate band and
+    ///         clears both latches: the old crossing no longer describes the
+    ///         new band, so the next valid crossing must be able to fire.
     function setThresholds(uint256 stopLoss_, uint256 takeProfit_) external onlyOwner {
+        require(stopLoss_ < takeProfit_, InvalidThresholds(stopLoss_, takeProfit_));
         stopLoss = stopLoss_;
         takeProfit = takeProfit_;
+        stopLossLatched = false;
+        takeProfitLatched = false;
         emit ThresholdsUpdated(stopLoss_, takeProfit_);
     }
 
@@ -124,9 +143,12 @@ contract PiggyGuardReactive is AbstractReactive {
             _onPrice(log_.topic1);
             return;
         }
-        // Cron tick on Lasna: one DCA buy per tick.
+        // Cron tick on Lasna: one DCA buy per tick. DCA is the lowest-priority
+        // strategy: while either exit latch is set, buying back in would undo
+        // the stop-loss / take-profit, so the tick is skipped until the price
+        // returns inside the band and the latches clear.
         if (log_.topic0 == cronTopic) {
-            if (dcaEnabled) {
+            if (dcaEnabled && !stopLossLatched && !takeProfitLatched) {
                 _requestDca();
             }
             return;
@@ -139,49 +161,57 @@ contract PiggyGuardReactive is AbstractReactive {
             if (!stopLossLatched) {
                 stopLossLatched = true;
                 takeProfitLatched = false;
-                _requestCallback("executeStopLoss(address,uint256)", price_);
+                _requestStopLoss(price_);
             }
         } else if (price_ >= takeProfit) {
             if (!takeProfitLatched) {
                 takeProfitLatched = true;
                 stopLossLatched = false;
-                _requestCallback("executeTakeProfit(address,uint256)", price_);
+                _requestTakeProfit(price_);
             }
         } else {
-            // Back inside the band: re-arm both crossings.
+            // Back inside the band: re-arm both crossings (and, with them, DCA).
             stopLossLatched = false;
             takeProfitLatched = false;
         }
     }
 
-    /// @notice Request a price-triggered callback (stop-loss / take-profit).
-    ///         The payload's first argument is address(0) by design: the
-    ///         network injects this contract's address there for the callback
-    ///         contract to verify.
-    function _requestCallback(string memory signature_, uint256 price_) internal {
-        bytes memory payload = abi.encodeWithSignature(signature_, address(0), price_);
-        emit ActionRequested(signature_, price_, block.timestamp);
-        SYSTEM.requestCallbackV_1_0(
-            ISystemContract.CallbackConfiguration_V_1_0({
-                chainId: BASE_SEPOLIA_CHAIN_ID,
-                recipient: callback,
-                gasLimit: CALLBACK_GAS_LIMIT,
-                payload: payload
-            })
-        );
+    /// @notice Request a stop-loss callback. The payload's first argument is
+    ///         address(0) by design: the network injects this contract's
+    ///         address there for the callback contract to verify.
+    function _requestStopLoss(uint256 price_) internal {
+        uint256 actionId = ++actionCounter;
+        bytes memory payload =
+            abi.encodeCall(PiggyGuardCallback.executeStopLoss, (address(0), price_, actionId));
+        emit ActionRequested("stopLoss", price_, block.timestamp);
+        _sendCallback(payload);
+    }
+
+    /// @notice Request a take-profit callback (same address(0) placeholder).
+    function _requestTakeProfit(uint256 price_) internal {
+        uint256 actionId = ++actionCounter;
+        bytes memory payload =
+            abi.encodeCall(PiggyGuardCallback.executeTakeProfit, (address(0), price_, actionId));
+        emit ActionRequested("takeProfit", price_, block.timestamp);
+        _sendCallback(payload);
     }
 
     /// @notice Request a DCA callback. The vault reads the price from the
     ///         feed itself, so the payload carries no price.
     function _requestDca() internal {
-        bytes memory payload = abi.encodeWithSignature("executeDCA(address)", address(0));
-        emit ActionRequested("executeDCA(address)", 0, block.timestamp);
+        uint256 actionId = ++actionCounter;
+        bytes memory payload = abi.encodeCall(PiggyGuardCallback.executeDCA, (address(0), actionId));
+        emit ActionRequested("dca", 0, block.timestamp);
+        _sendCallback(payload);
+    }
+
+    function _sendCallback(bytes memory payload_) internal {
         SYSTEM.requestCallbackV_1_0(
             ISystemContract.CallbackConfiguration_V_1_0({
                 chainId: BASE_SEPOLIA_CHAIN_ID,
                 recipient: callback,
                 gasLimit: CALLBACK_GAS_LIMIT,
-                payload: payload
+                payload: payload_
             })
         );
     }

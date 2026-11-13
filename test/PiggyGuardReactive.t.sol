@@ -5,6 +5,7 @@ import { Test } from "forge-std/Test.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { IReactive } from "@reactive/src/interfaces/IReactive.sol";
 import { MockPriceFeed } from "../src/MockPriceFeed.sol";
+import { PiggyGuardCallback } from "../src/PiggyGuardCallback.sol";
 import { PiggyGuardReactive } from "../src/PiggyGuardReactive.sol";
 import { MockSystem } from "./mocks/MockSystem.sol";
 
@@ -15,22 +16,37 @@ import { MockSystem } from "./mocks/MockSystem.sol";
 ///      succeed silently. react() is invoked via vm.prank(SYSTEM) so the
 ///      onlySystem guard passes, and requestCallbackV_1_0 likewise no-ops.
 ///      ActionRequested events are counted to prove exactly-once firing.
+///      MockSystem (etched at SYSTEM) additionally records the two
+///      subscriptions and every callback request, so the tests can assert the
+///      exact subscription tuple and the callback envelope (chain, recipient,
+///      gas limit, selector, price, actionId).
 contract PiggyGuardReactiveTest is Test {
     address constant SYSTEM = 0x8888888888888888888888888888888888888888;
+    address constant CALLBACK = address(0xCA11BAC);
+    address constant CRON_CONTRACT = 0x0000000000000000000000000000000000fffFfF;
 
-    MockPriceFeed feed;
-    PiggyGuardReactive guard;
+    uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
+    uint256 constant LASNA_CHAIN_ID = 5318007;
+    uint256 constant GAS_LIMIT = 1_000_000;
 
     uint256 constant PRICE_TOPIC = 0x945c1c4e99aa89f648fbfe3df471b916f719e16d960fcec0737d4d56bd696838;
     /// @notice Cron100 topic — must equal PiggyGuardReactive.CRON100_TOPIC.
     uint256 constant CRON_TOPIC = 0xb49937fb8970e19fd46d48f7e3fb00d659deac0347f79cd7cb542f0fc1503c70;
+    uint256 constant REACTIVE_IGNORE =
+        0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
+
     bytes32 constant ACTION_TOPIC = keccak256("ActionRequested(string,uint256,uint256)");
+
+    MockPriceFeed feed;
+    PiggyGuardReactive guard;
+    MockSystem system;
 
     function setUp() public {
         // The guard's constructor calls SYSTEM.subscribe; on a local chain
         // that address has no code and the call reverts, so etch a mock
         // system contract there first (test-only, never deployed on-chain).
         vm.etch(SYSTEM, type(MockSystem).runtimeCode);
+        system = MockSystem(payable(SYSTEM));
         feed = new MockPriceFeed(100_00000000); // $100.00
         guard = new PiggyGuardReactive(
             address(feed),
@@ -38,8 +54,10 @@ contract PiggyGuardReactiveTest is Test {
             120_00000000, // take-profit $120
             CRON_TOPIC
         );
-        guard.setCallback(address(0xCA11BAC));
+        guard.setCallback(CALLBACK);
     }
+
+    // ---- helpers ----
 
     function guardCronTopic() internal view returns (uint256) {
         return guard.CRON100_TOPIC();
@@ -47,7 +65,7 @@ contract PiggyGuardReactiveTest is Test {
 
     function priceLog(uint256 price_) internal view returns (IReactive.LogRecord memory) {
         return IReactive.LogRecord({
-            chainId: 84532,
+            chainId: BASE_SEPOLIA_CHAIN_ID,
             contractAddress: address(feed),
             topic0: PRICE_TOPIC,
             topic1: price_,
@@ -64,7 +82,7 @@ contract PiggyGuardReactiveTest is Test {
 
     function cronLog() internal view returns (IReactive.LogRecord memory) {
         return IReactive.LogRecord({
-            chainId: 5318007,
+            chainId: LASNA_CHAIN_ID,
             contractAddress: guard.CRON_CONTRACT(),
             topic0: guardCronTopic(),
             topic1: 0,
@@ -88,13 +106,92 @@ contract PiggyGuardReactiveTest is Test {
         return n;
     }
 
+    /// @dev Strip the 4-byte selector so the ABI arguments can be decoded.
+    function payloadArgs(bytes memory payload_) internal pure returns (bytes memory args) {
+        args = new bytes(payload_.length - 4);
+        for (uint256 i = 0; i < args.length; i++) {
+            args[i] = payload_[i + 4];
+        }
+    }
+
+    /// @dev H6: the callback must be addressed to Base Sepolia / callback with
+    ///      the fixed gas limit and the expected selector.
+    function assertCallbackEnvelope(bytes4 selector_) internal view {
+        assertEq(system.lastChainId(), BASE_SEPOLIA_CHAIN_ID);
+        assertEq(system.lastRecipient(), CALLBACK);
+        assertEq(system.lastGasLimit(), GAS_LIMIT);
+        assertEq(bytes32(bytes4(system.lastPayload())), bytes32(selector_));
+    }
+
+    function assertPricePayload(bytes4 selector_, uint256 expectedPrice_, uint256 expectedActionId)
+        internal
+        view
+    {
+        assertCallbackEnvelope(selector_);
+        (address sender, uint256 price, uint256 actionId) =
+            abi.decode(payloadArgs(system.lastPayload()), (address, uint256, uint256));
+        assertEq(sender, address(0)); // network-injected placeholder
+        assertEq(price, expectedPrice_);
+        assertEq(actionId, expectedActionId);
+    }
+
+    function assertDcaPayload(uint256 expectedActionId) internal view {
+        assertCallbackEnvelope(PiggyGuardCallback.executeDCA.selector);
+        (address sender, uint256 actionId) =
+            abi.decode(payloadArgs(system.lastPayload()), (address, uint256));
+        assertEq(sender, address(0));
+        assertEq(actionId, expectedActionId);
+    }
+
+    // ---- H7: subscription tuple ----
+
+    function testSubscriptionsMatchTheLoop() public view {
+        assertEq(system.subscribeCalls(), 2);
+
+        (
+            uint256 chainId0,
+            address contract0,
+            uint256 topic00,
+            uint256 topic10,
+            uint256 topic20,
+            uint256 topic30
+        ) = system.subscriptions(0);
+        assertEq(chainId0, BASE_SEPOLIA_CHAIN_ID); // Base Sepolia
+        assertEq(contract0, address(feed)); // MockPriceFeed
+        assertEq(topic00, PRICE_TOPIC); // PriceUpdated(uint256,uint256)
+        assertEq(topic10, REACTIVE_IGNORE);
+        assertEq(topic20, REACTIVE_IGNORE);
+        assertEq(topic30, REACTIVE_IGNORE);
+
+        (
+            uint256 chainId1,
+            address contract1,
+            uint256 topic01,
+            uint256 topic11,
+            uint256 topic21,
+            uint256 topic31
+        ) = system.subscriptions(1);
+        assertEq(chainId1, LASNA_CHAIN_ID); // Lasna
+        assertEq(contract1, CRON_CONTRACT); // 0x0000...fffFfF
+        assertEq(topic01, CRON_TOPIC); // Cron100(uint256)
+        assertEq(topic11, REACTIVE_IGNORE);
+        assertEq(topic21, REACTIVE_IGNORE);
+        assertEq(topic31, REACTIVE_IGNORE);
+    }
+
+    // ---- original price / latch behaviour (now with payload assertions) ----
+
     function testStopLossFiresOncePerCrossing() public {
         vm.recordLogs();
         vm.prank(SYSTEM);
         guard.react(priceLog(85_00000000)); // below $90 -> fires
+        assertEq(system.callbackRequests(), 1);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 1);
+
         vm.prank(SYSTEM);
         guard.react(priceLog(80_00000000)); // still below -> must NOT fire again
         assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 1);
         assertTrue(guard.stopLossLatched());
     }
 
@@ -109,6 +206,8 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(priceLog(85_00000000)); // fires again after re-arm
         assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 2);
     }
 
     function testTakeProfitFiresAndClearsStopLossLatch() public {
@@ -120,6 +219,8 @@ contract PiggyGuardReactiveTest is Test {
         assertEq(countActions(), 1);
         assertTrue(guard.takeProfitLatched());
         assertFalse(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 2);
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 2);
     }
 
     function testInBandPriceDoesNothing() public {
@@ -127,6 +228,7 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(priceLog(100_00000000));
         assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
     }
 
     function testCronTickRequestsDca() public {
@@ -137,6 +239,8 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(log);
         assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 1);
+        assertDcaPayload(1);
     }
 
     function testCronTickSkippedWhenDcaDisabled() public {
@@ -146,6 +250,7 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(log);
         assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
     }
 
     function testForeignLogIsIgnoredSilently() public {
@@ -155,10 +260,113 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(foreignLog); // must not revert, must not fire
         assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
     }
 
     function testNonSystemCannotCallReact() public {
         vm.expectRevert();
         guard.react(priceLog(85_00000000));
+    }
+
+    // ---- H2: DCA yields to the exit latches ----
+
+    function testStopLossLatchSuppressesDca() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // stop-loss fires, latch set
+        assertTrue(guard.stopLossLatched());
+
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log); // Cron tick must not buy back in
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 1); // only the stop-loss request
+    }
+
+    function testTakeProfitLatchSuppressesDca() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(130_00000000)); // take-profit fires, latch set
+        assertTrue(guard.takeProfitLatched());
+
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 1);
+    }
+
+    function testDcaResumesAfterBandReturn() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // stop-loss latched
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000)); // back in band -> latch cleared
+        assertFalse(guard.stopLossLatched());
+
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 2);
+        assertDcaPayload(2);
+    }
+
+    // ---- M1: threshold changes validate and re-arm ----
+
+    function testSetThresholdsRejectsInvertedBand() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PiggyGuardReactive.InvalidThresholds.selector, 120_00000000, 90_00000000
+            )
+        );
+        guard.setThresholds(120_00000000, 90_00000000);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PiggyGuardReactive.InvalidThresholds.selector, 100_00000000, 100_00000000
+            )
+        );
+        guard.setThresholds(100_00000000, 100_00000000);
+    }
+
+    function testSetThresholdsClearsLatchesAndAllowsNewCrossing() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // old stop-loss $90 latched
+        assertTrue(guard.stopLossLatched());
+
+        guard.setThresholds(80_00000000, 120_00000000); // lower the stop-loss
+        assertFalse(guard.stopLossLatched());
+        assertFalse(guard.takeProfitLatched());
+
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(75_00000000)); // valid new crossing of $80
+        assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 75_00000000, 2);
+    }
+
+    // ---- M3: action ids are monotonic across all three actions ----
+
+    function testActionIdsAreMonotonicAcrossActions() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // stop-loss -> id 1
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 1);
+
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000)); // back in band
+        vm.prank(SYSTEM);
+        guard.react(priceLog(130_00000000)); // take-profit -> id 2
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 2);
+
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000)); // back in band, DCA allowed again
+        IReactive.LogRecord memory log = cronLog();
+        vm.prank(SYSTEM);
+        guard.react(log); // DCA -> id 3
+        assertDcaPayload(3);
+        assertEq(guard.actionCounter(), 3);
+        assertEq(system.callbackRequests(), 3);
     }
 }

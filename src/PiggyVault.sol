@@ -28,6 +28,7 @@ contract PiggyVault {
     event TakeProfitExecuted(uint256 price, uint256 sold, uint256 received);
     event DcaExecuted(uint256 price, uint256 spent, uint256 bought);
     event DcaSkipped(string reason, uint256 safeBalance);
+    event ActionIgnored(uint256 actionId, uint256 lastActionId);
     event ExecutorUpdated(address indexed executor);
     event DcaAmountUpdated(uint256 amount);
     event Paused(address indexed by);
@@ -37,6 +38,7 @@ contract PiggyVault {
     error NotExecutor(address sender);
     error PausedVault();
     error InsufficientBalance(uint256 requested, uint256 available);
+    error ZeroPrice();
 
     address public immutable owner;
     MockPriceFeed public immutable priceFeed;
@@ -49,6 +51,9 @@ contract PiggyVault {
     uint256 public safeBalance;
     /// @notice Safe-asset amount spent on every DCA tick (8 decimals, USD).
     uint256 public dcaAmount;
+    /// @notice Highest action id executed so far; callbacks with an id at or
+    ///         below this are replays / out-of-order deliveries and are ignored.
+    uint256 public lastActionId;
     bool public paused;
 
     modifier onlyOwner() {
@@ -119,7 +124,15 @@ contract PiggyVault {
     // ---- executor: the three automated actions ----
 
     /// @notice Sell the entire risk position into the safe asset at `price_`.
-    function executeStopLoss(uint256 price_) external onlyExecutor whenNotPaused {
+    /// @param actionId_ Monotonic id assigned by the reactive contract. A
+    ///        duplicate or out-of-order id is ignored (event only, no revert)
+    ///        so a replayed callback can never execute twice.
+    function executeStopLoss(uint256 price_, uint256 actionId_)
+        external
+        onlyExecutor
+        whenNotPaused
+    {
+        if (_consumeAction(actionId_)) return;
         uint256 sold = riskBalance;
         uint256 received = (sold * price_) / PRICE_SCALE;
         riskBalance = 0;
@@ -128,7 +141,12 @@ contract PiggyVault {
     }
 
     /// @notice Sell TAKE_PROFIT_BPS of the risk position at `price_`.
-    function executeTakeProfit(uint256 price_) external onlyExecutor whenNotPaused {
+    function executeTakeProfit(uint256 price_, uint256 actionId_)
+        external
+        onlyExecutor
+        whenNotPaused
+    {
+        if (_consumeAction(actionId_)) return;
         uint256 sold = (riskBalance * TAKE_PROFIT_BPS) / 10000;
         uint256 received = (sold * price_) / PRICE_SCALE;
         riskBalance -= sold;
@@ -139,15 +157,32 @@ contract PiggyVault {
     /// @notice Spend `dcaAmount` of the safe asset to buy the risk asset at the
     ///         feed's latest price. Skips gracefully (no revert) when the safe
     ///         balance is too low, so a routine shortfall never fails a callback.
-    function executeDCA() external onlyExecutor whenNotPaused {
+    function executeDCA(uint256 actionId_) external onlyExecutor whenNotPaused {
+        if (_consumeAction(actionId_)) return;
         if (safeBalance < dcaAmount) {
             emit DcaSkipped("insufficient safe balance", safeBalance);
             return;
         }
         uint256 price = priceFeed.latestPrice();
+        // Defence in depth: the feed rejects pushPrice(0), but a feed deployed
+        // with a zero initial price would still divide by zero here.
+        if (price == 0) revert ZeroPrice();
         uint256 bought = (dcaAmount * PRICE_SCALE) / price;
         safeBalance -= dcaAmount;
         riskBalance += bought;
         emit DcaExecuted(price, dcaAmount, bought);
+    }
+
+    /// @dev Marks `actionId_` as consumed and returns false when it is new.
+    ///      Returns true (and emits ActionIgnored) when it is a replay or an
+    ///      out-of-order delivery, in which case the caller must do nothing.
+    function _consumeAction(uint256 actionId_) internal returns (bool) {
+        uint256 last = lastActionId;
+        if (actionId_ <= last) {
+            emit ActionIgnored(actionId_, last);
+            return true;
+        }
+        lastActionId = actionId_;
+        return false;
     }
 }

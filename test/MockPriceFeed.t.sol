@@ -30,4 +30,11 @@ contract MockPriceFeedTest is Test {
         vm.expectRevert(abi.encodeWithSelector(MockPriceFeed.NotOwner.selector, address(0xBEEF)));
         feed.pushPrice(1);
     }
+
+    function testPushZeroReverts() public {
+        vm.expectRevert(MockPriceFeed.ZeroPrice.selector);
+        feed.pushPrice(0);
+        // The rejected push must not change the stored price.
+        assertEq(feed.latestPrice(), 100_00000000);
+    }
 }

@@ -16,6 +16,7 @@ contract MockPriceFeed {
     event PriceUpdated(uint256 indexed price, uint256 timestamp);
 
     error NotOwner(address sender);
+    error ZeroPrice();
 
     address public immutable owner;
     uint256 public latestPrice;
@@ -28,8 +29,11 @@ contract MockPriceFeed {
     }
 
     /// @notice Push a new price and emit the event the reactive contract watches.
+    /// @dev Rejects 0: a zero price would make every DCA divide by zero and
+    ///      would let a stop-loss sell the whole position for nothing.
     function pushPrice(uint256 price_) external {
         if (msg.sender != owner) revert NotOwner(msg.sender);
+        if (price_ == 0) revert ZeroPrice();
         latestPrice = price_;
         latestTimestamp = block.timestamp;
         emit PriceUpdated(price_, block.timestamp);

@@ -8,15 +8,43 @@ import { ISystemContract } from "@reactive/src/interfaces/ISystemContract.sol";
 ///         callback requests so tests can assert on them. It is NOT part of
 ///         the deployed system and never goes on-chain.
 contract MockSystem {
+    struct Subscription {
+        uint256 chainId;
+        address contractAddress;
+        uint256 topic0;
+        uint256 topic1;
+        uint256 topic2;
+        uint256 topic3;
+    }
+
     uint256 public subscribeCalls;
+    Subscription[] public subscriptions;
+
     uint256 public callbackRequests;
     bytes public lastPayload;
     uint256 public lastChainId;
     address public lastRecipient;
     uint64 public lastGasLimit;
 
-    function subscribe(uint256, address, uint256, uint256, uint256, uint256) external {
+    function subscribe(
+        uint256 chainId_,
+        address contract_,
+        uint256 topic0_,
+        uint256 topic1_,
+        uint256 topic2_,
+        uint256 topic3_
+    ) external {
         subscribeCalls++;
+        subscriptions.push(
+            Subscription({
+                chainId: chainId_,
+                contractAddress: contract_,
+                topic0: topic0_,
+                topic1: topic1_,
+                topic2: topic2_,
+                topic3: topic3_
+            })
+        );
     }
 
     function unsubscribe(uint256, address, uint256, uint256, uint256, uint256) external {}
