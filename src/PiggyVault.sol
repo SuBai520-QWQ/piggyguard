@@ -26,6 +26,8 @@ contract PiggyVault {
     event Withdrawn(string indexed asset, uint256 amount);
     event StopLossExecuted(uint256 price, uint256 sold, uint256 received);
     event TakeProfitExecuted(uint256 price, uint256 sold, uint256 received);
+    event StopLossSkipped(string reason, uint256 price);
+    event TakeProfitSkipped(string reason, uint256 price);
     event DcaExecuted(uint256 price, uint256 spent, uint256 bought);
     event DcaSkipped(string reason, uint256 safeBalance);
     event ActionIgnored(uint256 actionId, uint256 lastActionId);
@@ -39,6 +41,8 @@ contract PiggyVault {
     error PausedVault();
     error InsufficientBalance(uint256 requested, uint256 available);
     error ZeroPrice();
+    error ZeroAddress();
+    error ZeroAmount();
 
     address public immutable owner;
     MockPriceFeed public immutable priceFeed;
@@ -72,6 +76,10 @@ contract PiggyVault {
     }
 
     constructor(address priceFeed_, uint256 dcaAmount_) {
+        // Fail at deployment, not at demo time: a zero feed address would make
+        // every DCA revert, and a zero DCA amount would silently disable DCA.
+        if (priceFeed_ == address(0)) revert ZeroAddress();
+        if (dcaAmount_ == 0) revert ZeroAmount();
         owner = msg.sender;
         priceFeed = MockPriceFeed(priceFeed_);
         dcaAmount = dcaAmount_;
@@ -102,11 +110,15 @@ contract PiggyVault {
     }
 
     function setExecutor(address executor_) external onlyOwner {
+        // Zero is rejected: it would silently disable every automated action.
+        // To pause execution instead, use pause().
+        if (executor_ == address(0)) revert ZeroAddress();
         executor = executor_;
         emit ExecutorUpdated(executor_);
     }
 
     function setDcaAmount(uint256 dcaAmount_) external onlyOwner {
+        if (dcaAmount_ == 0) revert ZeroAmount();
         dcaAmount = dcaAmount_;
         emit DcaAmountUpdated(dcaAmount_);
     }
@@ -134,6 +146,12 @@ contract PiggyVault {
     {
         if (_consumeAction(actionId_)) return;
         uint256 sold = riskBalance;
+        if (sold == 0) {
+            // Nothing to sell: a zero-quantity "success" event would pollute
+            // the evidence trail, so report the skip explicitly instead.
+            emit StopLossSkipped("no risk balance", price_);
+            return;
+        }
         uint256 received = (sold * price_) / PRICE_SCALE;
         riskBalance = 0;
         safeBalance += received;
@@ -148,6 +166,11 @@ contract PiggyVault {
     {
         if (_consumeAction(actionId_)) return;
         uint256 sold = (riskBalance * TAKE_PROFIT_BPS) / 10000;
+        if (sold == 0) {
+            // Dust position: 50% rounds down to zero; skip, don't fake a sale.
+            emit TakeProfitSkipped("position too small to sell 50%", price_);
+            return;
+        }
         uint256 received = (sold * price_) / PRICE_SCALE;
         riskBalance -= sold;
         safeBalance += received;
@@ -168,6 +191,12 @@ contract PiggyVault {
         // with a zero initial price would still divide by zero here.
         if (price == 0) revert ZeroPrice();
         uint256 bought = (dcaAmount * PRICE_SCALE) / price;
+        if (bought == 0) {
+            // Extreme price: the fixed amount buys nothing after rounding.
+            // Skip without charging — never spend the full amount for zero.
+            emit DcaSkipped("price too high: buys zero", safeBalance);
+            return;
+        }
         safeBalance -= dcaAmount;
         riskBalance += bought;
         emit DcaExecuted(price, dcaAmount, bought);

@@ -100,4 +100,21 @@ contract PiggyGuardCallbackTest is Test {
         assertEq(vault.safeBalance(), 260_00000000);
         assertEq(vault.lastActionId(), 1);
     }
+
+    // ---- M6: constructor zero-address validation ----
+
+    function testConstructorRejectsZeroProxy() public {
+        vm.expectRevert(PiggyGuardCallback.ZeroAddress.selector);
+        new PiggyGuardCallback(IPayable(payable(address(0))), REACTIVE, address(vault));
+    }
+
+    function testConstructorRejectsZeroReactive() public {
+        vm.expectRevert(PiggyGuardCallback.ZeroAddress.selector);
+        new PiggyGuardCallback(IPayable(payable(PROXY)), address(0), address(vault));
+    }
+
+    function testConstructorRejectsZeroVault() public {
+        vm.expectRevert(PiggyGuardCallback.ZeroAddress.selector);
+        new PiggyGuardCallback(IPayable(payable(PROXY)), REACTIVE, address(0));
+    }
 }

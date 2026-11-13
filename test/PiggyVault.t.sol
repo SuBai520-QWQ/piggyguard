@@ -12,6 +12,9 @@ contract PiggyVaultTest is Test {
     address executor = address(0xCA11BAC);
 
     event ActionIgnored(uint256 actionId, uint256 lastActionId);
+    event StopLossSkipped(string reason, uint256 price);
+    event TakeProfitSkipped(string reason, uint256 price);
+    event DcaSkipped(string reason, uint256 safeBalance);
 
     function setUp() public {
         feed = new MockPriceFeed(100_00000000); // $100.00
@@ -127,5 +130,73 @@ contract PiggyVaultTest is Test {
         assertEq(vault.safeBalance(), 90_00000000);
         assertEq(vault.riskBalance(), riskAfterFirst);
         assertEq(vault.lastActionId(), 2);
+    }
+
+    // ---- M6: zero-address / zero-amount validation ----
+
+    function testConstructorRejectsZeroFeed() public {
+        vm.expectRevert(PiggyVault.ZeroAddress.selector);
+        new PiggyVault(address(0), 10_00000000);
+    }
+
+    function testConstructorRejectsZeroDcaAmount() public {
+        vm.expectRevert(PiggyVault.ZeroAmount.selector);
+        new PiggyVault(address(feed), 0);
+    }
+
+    function testSetExecutorRejectsZeroAddress() public {
+        vm.expectRevert(PiggyVault.ZeroAddress.selector);
+        vault.setExecutor(address(0));
+        assertEq(vault.executor(), executor); // unchanged
+    }
+
+    function testSetDcaAmountRejectsZero() public {
+        vm.expectRevert(PiggyVault.ZeroAmount.selector);
+        vault.setDcaAmount(0);
+        assertEq(vault.dcaAmount(), 10_00000000); // unchanged
+    }
+
+    // ---- M11: zero-trade executions skip instead of emitting success ----
+
+    function testStopLossOnEmptyPositionSkips() public {
+        PiggyVault empty = new PiggyVault(address(feed), 10_00000000);
+        empty.setExecutor(executor);
+        empty.fundSafe(100_00000000); // safe only, no risk position
+
+        vm.expectEmit(false, false, false, true, address(empty));
+        emit StopLossSkipped("no risk balance", 80_00000000);
+        vm.prank(executor);
+        empty.executeStopLoss(80_00000000, 1);
+        assertEq(empty.riskBalance(), 0);
+        assertEq(empty.safeBalance(), 100_00000000); // nothing "sold for free"
+        assertEq(empty.lastActionId(), 1); // the action is still consumed
+    }
+
+    function testTakeProfitOnDustPositionSkips() public {
+        PiggyVault dust = new PiggyVault(address(feed), 10_00000000);
+        dust.setExecutor(executor);
+        dust.fundRisk(1); // 1 wei: 50% rounds down to a zero sale
+
+        vm.expectEmit(false, false, false, true, address(dust));
+        emit TakeProfitSkipped("position too small to sell 50%", 120_00000000);
+        vm.prank(executor);
+        dust.executeTakeProfit(120_00000000, 1);
+        assertEq(dust.riskBalance(), 1); // untouched
+        assertEq(dust.safeBalance(), 0);
+    }
+
+    function testDcaAtExtremePriceSkipsWithoutCharging() public {
+        // $20 billion per unit: $10 buys 0 units after integer division.
+        MockPriceFeed moonFeed = new MockPriceFeed(20_000_000_000_00000000);
+        PiggyVault moonVault = new PiggyVault(address(moonFeed), 10_00000000);
+        moonVault.setExecutor(executor);
+        moonVault.fundSafe(100_00000000);
+
+        vm.expectEmit(false, false, false, true, address(moonVault));
+        emit DcaSkipped("price too high: buys zero", 100_00000000);
+        vm.prank(executor);
+        moonVault.executeDCA(1); // must not revert, must not charge
+        assertEq(moonVault.safeBalance(), 100_00000000); // full amount kept
+        assertEq(moonVault.riskBalance(), 0);
     }
 }

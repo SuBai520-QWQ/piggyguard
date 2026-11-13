@@ -58,6 +58,7 @@ contract PiggyGuardReactive is AbstractReactive {
 
     error NotOwner(address sender);
     error ZeroAddress();
+    error ZeroTopic();
     error InvalidThresholds(uint256 stopLoss, uint256 takeProfit);
 
     address public immutable owner;
@@ -90,6 +91,12 @@ contract PiggyGuardReactive is AbstractReactive {
         payable
     {
         if (priceFeed_ == address(0)) revert ZeroAddress();
+        // Same band rule as setThresholds, enforced from deployment: an
+        // inverted band would make the in-band branch unreachable.
+        if (stopLoss_ >= takeProfit_) revert InvalidThresholds(stopLoss_, takeProfit_);
+        // A zero Cron topic can never match a real tick; DCA would be
+        // silently dead while the subscription still bills every tick.
+        if (cronTopic_ == 0) revert ZeroTopic();
         owner = msg.sender;
         priceFeed = priceFeed_;
         stopLoss = stopLoss_;
@@ -180,6 +187,12 @@ contract PiggyGuardReactive is AbstractReactive {
     ///         address(0) by design: the network injects this contract's
     ///         address there for the callback contract to verify.
     function _requestStopLoss(uint256 price_) internal {
+        // M12: until setCallback wires the destination, requests are dropped
+        // silently — a callback to address(0) can never succeed, but every
+        // react() that asks for one is still billed against the reserves.
+        // The latch set in _onPrice still applies; wiring the callback and a
+        // fresh crossing (after a band return) resumes normal operation.
+        if (callback == address(0)) return;
         uint256 actionId = ++actionCounter;
         bytes memory payload =
             abi.encodeCall(PiggyGuardCallback.executeStopLoss, (address(0), price_, actionId));
@@ -189,6 +202,7 @@ contract PiggyGuardReactive is AbstractReactive {
 
     /// @notice Request a take-profit callback (same address(0) placeholder).
     function _requestTakeProfit(uint256 price_) internal {
+        if (callback == address(0)) return; // M12, see _requestStopLoss
         uint256 actionId = ++actionCounter;
         bytes memory payload =
             abi.encodeCall(PiggyGuardCallback.executeTakeProfit, (address(0), price_, actionId));
@@ -199,6 +213,7 @@ contract PiggyGuardReactive is AbstractReactive {
     /// @notice Request a DCA callback. The vault reads the price from the
     ///         feed itself, so the payload carries no price.
     function _requestDca() internal {
+        if (callback == address(0)) return; // M12, see _requestStopLoss
         uint256 actionId = ++actionCounter;
         bytes memory payload = abi.encodeCall(PiggyGuardCallback.executeDCA, (address(0), actionId));
         emit ActionRequested("dca", 0, block.timestamp);

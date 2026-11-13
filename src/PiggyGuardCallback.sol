@@ -23,12 +23,20 @@ contract PiggyGuardCallback is AbstractCallback {
         string action, address indexed reactiveSender, uint256 price, uint256 actionId
     );
 
+    error ZeroAddress();
+
     PiggyVault public immutable vault;
 
     constructor(IPayable callbackProxy_, address reactiveContract_, address vault_)
         payable
         AbstractCallback(callbackProxy_, reactiveContract_)
     {
+        // A zero in any of the three wiring addresses would silently disable
+        // authentication or forwarding; fail the deployment instead.
+        if (
+            address(callbackProxy_) == address(0) || reactiveContract_ == address(0)
+                || vault_ == address(0)
+        ) revert ZeroAddress();
         vault = PiggyVault(vault_);
     }
 

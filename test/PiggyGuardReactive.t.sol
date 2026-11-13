@@ -369,4 +369,56 @@ contract PiggyGuardReactiveTest is Test {
         assertEq(guard.actionCounter(), 3);
         assertEq(system.callbackRequests(), 3);
     }
+
+    // ---- M6: constructor validation ----
+
+    function testConstructorRejectsZeroCronTopic() public {
+        vm.expectRevert(PiggyGuardReactive.ZeroTopic.selector);
+        new PiggyGuardReactive(address(feed), 90_00000000, 120_00000000, 0);
+    }
+
+    function testConstructorRejectsInvertedThresholds() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PiggyGuardReactive.InvalidThresholds.selector, 120_00000000, 90_00000000
+            )
+        );
+        new PiggyGuardReactive(address(feed), 120_00000000, 90_00000000, CRON_TOPIC);
+    }
+
+    // ---- M12: no billed callback requests before the callback is wired ----
+
+    function testNoRequestsBeforeCallbackIsSet() public {
+        // Deploy a second guard and deliberately skip setCallback: between the
+        // reactive deployment and WireUp, Cron ticks and price crossings must
+        // not produce (billed) callback requests to the zero address.
+        PiggyGuardReactive unwired =
+            new PiggyGuardReactive(address(feed), 90_00000000, 120_00000000, CRON_TOPIC);
+        uint256 requestsBefore = system.callbackRequests();
+
+        IReactive.LogRecord memory log = IReactive.LogRecord({
+            chainId: LASNA_CHAIN_ID,
+            contractAddress: CRON_CONTRACT,
+            topic0: CRON_TOPIC,
+            topic1: 0,
+            topic2: 0,
+            topic3: 0,
+            data: "",
+            blockNumber: 1,
+            opCode: 0,
+            blockHash: 0,
+            txHash: 0,
+            logIndex: 0
+        });
+        vm.prank(SYSTEM);
+        unwired.react(log); // Cron tick with callback == address(0)
+        assertEq(system.callbackRequests(), requestsBefore);
+        assertEq(unwired.actionCounter(), 0);
+
+        vm.prank(SYSTEM);
+        unwired.react(priceLog(85_00000000)); // crossing: latch sets, no request
+        assertTrue(unwired.stopLossLatched());
+        assertEq(system.callbackRequests(), requestsBefore);
+        assertEq(unwired.actionCounter(), 0);
+    }
 }
