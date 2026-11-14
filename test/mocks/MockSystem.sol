@@ -18,6 +18,7 @@ contract MockSystem {
     }
 
     uint256 public subscribeCalls;
+    uint256 public unsubscribeCalls;
     Subscription[] public subscriptions;
 
     uint256 public callbackRequests;
@@ -47,7 +48,9 @@ contract MockSystem {
         );
     }
 
-    function unsubscribe(uint256, address, uint256, uint256, uint256, uint256) external {}
+    function unsubscribe(uint256, address, uint256, uint256, uint256, uint256) external {
+        unsubscribeCalls++;
+    }
 
     function requestCallbackV_1_0(ISystemContract.CallbackConfiguration_V_1_0 memory config_)
         external

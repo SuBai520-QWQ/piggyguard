@@ -27,7 +27,10 @@ import { PiggyGuardReactive } from "../src/PiggyGuardReactive.sol";
 ///         plus the addresses printed by earlier steps (PRICE_FEED, VAULT,
 ///         REACTIVE, CALLBACK). Optional: INITIAL_PRICE (default $100),
 ///         STOP_LOSS (default $90), TAKE_PROFIT (default $120), DCA_AMOUNT
-///         (default $10).
+///         (default $10), REACTIVE_RESERVE (default 0.1 ether — the Lasna
+///         reserve the reactive contract starts with; size it as
+///         expected reactions × per-reaction cost and re-check `debt`
+///         before demo day, see README "Reserves").
 ///         After deployment: fund the reactive contract's SYSTEM reserves with
 ///         `depositTo` (lREACT) and the callback contract's proxy reserves
 ///         (Base Sepolia ETH) — see README "Reserves" — or the loop silently
@@ -62,9 +65,12 @@ contract DeployReactive is Script {
         address priceFeed = vm.envAddress("PRICE_FEED");
         uint256 stopLoss = vm.envOr("STOP_LOSS", uint256(90_00000000));
         uint256 takeProfit = vm.envOr("TAKE_PROFIT", uint256(120_00000000));
+        // Reserve the reactive contract starts with (review H4/L7): was a
+        // hardcoded 0.1 ether; now env-configurable with the same default.
+        uint256 reserve = vm.envOr("REACTIVE_RESERVE", uint256(0.1 ether));
 
         vm.startBroadcast(deployerKey);
-        PiggyGuardReactive guard = new PiggyGuardReactive{ value: 0.1 ether }(
+        PiggyGuardReactive guard = new PiggyGuardReactive{ value: reserve }(
             priceFeed, stopLoss, takeProfit, CRON100_TOPIC
         );
         vm.stopBroadcast();
@@ -84,6 +90,10 @@ contract WireUpBase is Script {
         address proxy = vm.envAddress("BASE_SEPOLIA_CALLBACK_PROXY");
         address reactive = vm.envAddress("REACTIVE");
         address vaultAddr = vm.envAddress("VAULT");
+        // Fail fast on a mistyped VAULT (review M7): the vault lives on this
+        // chain, so it must have code here. The reactive address must NOT be
+        // checked — it lives on Lasna and has no code on Base Sepolia (C1).
+        require(vaultAddr.code.length > 0, "VAULT has no code on this chain");
 
         vm.startBroadcast(deployerKey);
         PiggyGuardCallback callback =
@@ -105,6 +115,9 @@ contract WireUpReactive is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address reactive = vm.envAddress("REACTIVE");
         address callbackAddr = vm.envAddress("CALLBACK");
+        // Fail fast on a mistyped REACTIVE (review M7): unlike in WireUpBase,
+        // the reactive contract DOES live on this chain (Lasna).
+        require(reactive.code.length > 0, "REACTIVE has no code on this chain");
 
         vm.startBroadcast(deployerKey);
         PiggyGuardReactive(payable(reactive)).setCallback(callbackAddr);

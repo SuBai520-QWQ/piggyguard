@@ -37,4 +37,11 @@ contract MockPriceFeedTest is Test {
         // The rejected push must not change the stored price.
         assertEq(feed.latestPrice(), 100_00000000);
     }
+
+    /// @notice fix-03 (Perch P13): a zero initial price is rejected at
+    ///         deployment instead of poisoning every consumer.
+    function testConstructorRejectsZeroPrice() public {
+        vm.expectRevert(MockPriceFeed.ZeroPrice.selector);
+        new MockPriceFeed(0);
+    }
 }

@@ -45,7 +45,7 @@ The three strategies share one position, so they are not independent:
 
 **Recovery:** a price strictly inside the band (`stopLoss < price < takeProfit`) clears both latches, and DCA resumes on the next Cron100 tick. Changing the band with `setThresholds` also clears both latches (and rejects `stopLoss >= takeProfit`), so a new valid crossing is not swallowed by a stale latch.
 
-Every callback also carries a monotonically increasing `actionId`; the vault executes only ids above `lastActionId`, so a replayed or out-of-order callback is ignored instead of selling or buying twice.
+Every callback also carries a monotonically increasing `actionId` from the reactive contract's single shared counter. The vault keeps a **separate replay watermark per action type** (`lastStopLossId` / `lastTakeProfitId` / `lastDcaId`): a delivery at or below its own type's watermark is ignored as a replay, but an out-of-order delivery of one type can never swallow an action of another type (fix-03 — the previous single watermark could permanently drop an in-flight stop-loss). Only actions that actually execute advance a watermark; skipped actions (paused vault, zero or feed-deviating price, nothing to sell, insufficient balance) leave the id usable, and guard failures are reported as `*Skipped` events instead of reverting, so a callback is never silently lost to a revert. Trigger prices are also sanity-checked against the feed: a stop-loss / take-profit price deviating from `latestPrice()` by more than 20% is skipped, and DCA has a circuit breaker that skips one tick after a >20% price jump instead of buying blind at the new level.
 
 ## Contracts
 
@@ -60,7 +60,9 @@ All prices and ledger amounts use **8 decimals** (USD-pegged, Chainlink style).
 
 ### Honest mock boundary
 
-The vault is a **mock ledger**, not a real DEX trade: balances are ledger units and execution is a virtual swap at the trigger price. This is deliberate — the demo must never depend on testnet DEX liquidity, and the thing being judged is the automation loop (reactive contract doing real work: watching, judging, scheduling). A mock-ERC20 venue can replace the ledger later without touching the reactive or callback contracts. No real tokens ever move; this is a testnet demo.
+The vault is a **mock ledger**, not a real DEX trade: balances are ledger units and execution is a virtual swap at the trigger price. `fundRisk` / `fundSafe` / `withdrawRisk` / `withdrawSafe` are owner-only ledger operations — there is **no ERC20 deposit/withdraw path and no end-user funding flow**; the ledger exists to make the automation's decisions observable, not to custody assets. This is deliberate — the demo must never depend on testnet DEX liquidity, and the thing being judged is the automation loop (reactive contract doing real work: watching, judging, scheduling). A mock-ERC20 venue can replace the ledger later without touching the reactive or callback contracts. No real tokens ever move; this is a testnet demo.
+
+**Trust assumptions.** The price feed is single-owner and trusted by design (it is the demo's controlled price source); the vault's 20% deviation guard bounds what a stale or wrong trigger price can do, but it cannot make an untrusted feed trustworthy. Operationally, two wirings must be kept in sync by hand: changing the callback (`setCallback`) requires the matching `vault.setExecutor`, and the Cron contract address / topic follow plan §2.1 and are re-verified live on Lasna in stage 3.
 
 ## Build & test
 
@@ -69,7 +71,7 @@ forge build
 forge test
 ```
 
-Expected: 4 contracts compile (Solidity 0.8.29), 35 local tests pass — feed auth and zero-price rejection, vault math with replay/out-of-order protection, callback authentication and forwarding, and the reactive decision logic (subscription tuple, latches, DCA priority, threshold re-arm, callback envelope, monotonic action ids). `react()` is driven in tests via `vm.prank` of the SYSTEM address `0x8888…8888`, with a mock system contract etched there so the constructor's `subscribe` calls land and can be asserted.
+Expected: 4 contracts compile (Solidity 0.8.29), 66 local tests pass — feed auth and zero-price rejection (push and constructor), vault math with per-type replay watermarks and cross-type out-of-order delivery, skip-instead-of-revert guards (pause / zero price / price deviation), the DCA circuit breaker, callback authentication and forwarding, and the reactive decision logic (subscription tuple, latches, DCA priority and Cron unsubscribe, threshold re-arm, callback envelope, monotonic action ids, log chain/contract validation). `react()` is driven in tests via `vm.prank` of the SYSTEM address `0x8888…8888`, with a mock system contract etched there so the constructor's `subscribe` calls land and can be asserted.
 
 ## Deploy (four steps, testnets only)
 
@@ -143,7 +145,7 @@ Expected chain of events: Base Sepolia `PriceUpdated(85e8)` → Lasna `react()` 
 
 ### Reserves — read this before demo day (plan R4)
 
-- **Reactive contract (Lasna):** reaction transactions are billed to the contract itself. Top up via the system contract's `depositTo` (lREACT) and check `debt` — a contract with `debt > 0` silently stops receiving reactions.
+- **Reactive contract (Lasna):** reaction transactions are billed to the contract itself. Top up via the system contract's `depositTo` (lREACT) and check `debt` — a contract with `debt > 0` silently stops receiving reactions. The starting reserve is set at deploy time and is env-configurable (`REACTIVE_RESERVE`, default `0.1 ether`, in `script/Deploy.s.sol`); size it as expected reactions × per-reaction cost for the run you are planning, and re-check `debt` before demo day. Disabling DCA (`setDcaEnabled(false)`) also unsubscribes the Cron ticks, so a disabled strategy stops billing instead of just ignoring ticks.
 - **Callback contract (Base Sepolia):** callbacks are billed to the recipient on the destination chain. Fund it through the callback proxy's `depositTo` before the demo.
 
 #### Callback reserve: copy-paste steps (H3)

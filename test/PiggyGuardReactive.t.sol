@@ -35,7 +35,7 @@ contract PiggyGuardReactiveTest is Test {
     uint256 constant REACTIVE_IGNORE =
         0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
 
-    bytes32 constant ACTION_TOPIC = keccak256("ActionRequested(string,uint256,uint256)");
+    bytes32 constant ACTION_TOPIC = keccak256("ActionRequested(string,uint256,uint256,uint256)");
 
     MockPriceFeed feed;
     PiggyGuardReactive guard;
@@ -416,9 +416,118 @@ contract PiggyGuardReactiveTest is Test {
         assertEq(unwired.actionCounter(), 0);
 
         vm.prank(SYSTEM);
-        unwired.react(priceLog(85_00000000)); // crossing: latch sets, no request
-        assertTrue(unwired.stopLossLatched());
+        unwired.react(priceLog(85_00000000)); // crossing: dropped, no request
+        // fix-03 (Perch P11): the latch is NOT set — the crossing stays armed
+        // so it can still fire once the callback is wired.
+        assertFalse(unwired.stopLossLatched());
         assertEq(system.callbackRequests(), requestsBefore);
         assertEq(unwired.actionCounter(), 0);
+
+        // Wire the callback: the very next delivery of the same crossing fires.
+        unwired.setCallback(CALLBACK);
+        vm.prank(SYSTEM);
+        unwired.react(priceLog(85_00000000));
+        assertTrue(unwired.stopLossLatched());
+        assertEq(system.callbackRequests(), requestsBefore + 1);
+        assertEq(unwired.actionCounter(), 1);
+    }
+
+    // ---- fix-03: log validation and zero / boundary prices ----
+
+    function testZeroPriceLogIsIgnored() public {
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(0)); // malformed: must not read as a stop-loss
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
+        assertFalse(guard.stopLossLatched());
+    }
+
+    function testPriceLogFromWrongChainIsIgnored() public {
+        IReactive.LogRecord memory log = priceLog(50_00000000);
+        log.chainId = 1; // not Base Sepolia
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
+    }
+
+    function testCronLogFromWrongContractIsIgnored() public {
+        IReactive.LogRecord memory log = cronLog();
+        log.contractAddress = address(0xDEAD); // Cron topic, wrong emitter
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 0);
+    }
+
+    function testStopLossTriggersAtExactThreshold() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(90_00000000)); // price == stopLoss: triggers (<=)
+        assertTrue(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 1);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 90_00000000, 1);
+    }
+
+    function testTakeProfitTriggersAtExactThreshold() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(120_00000000)); // price == takeProfit: triggers (>=)
+        assertTrue(guard.takeProfitLatched());
+        assertEq(system.callbackRequests(), 1);
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 120_00000000, 1);
+    }
+
+    // ---- fix-03 (Perch P8 / PG-N4): zero stop-loss is not a valid band ----
+
+    function testConstructorRejectsZeroStopLoss() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PiggyGuardReactive.InvalidThresholds.selector, 0, 120_00000000
+            )
+        );
+        new PiggyGuardReactive(address(feed), 0, 120_00000000, CRON_TOPIC);
+    }
+
+    function testSetThresholdsRejectsZeroStopLoss() public {
+        vm.expectRevert(
+            abi.encodeWithSelector(PiggyGuardReactive.InvalidThresholds.selector, 0, 120_00000000)
+        );
+        guard.setThresholds(0, 120_00000000);
+        assertEq(guard.stopLoss(), 90_00000000); // unchanged
+    }
+
+    // ---- fix-03 (M5): explicit latch recovery ----
+
+    function testResetLatchesRearmsCrossing() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // fires + latches
+        assertTrue(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 1);
+
+        guard.resetLatches();
+        assertFalse(guard.stopLossLatched());
+
+        vm.prank(SYSTEM);
+        guard.react(priceLog(84_00000000)); // still below band: fires again
+        assertEq(system.callbackRequests(), 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 84_00000000, 2);
+    }
+
+    // ---- fix-03 (M2): disabling DCA unsubscribes the Cron ticks ----
+
+    function testSetDcaEnabledUnsubscribesAndResubscribes() public {
+        assertEq(system.subscribeCalls(), 2); // constructor: price + cron
+        guard.setDcaEnabled(false);
+        assertEq(system.unsubscribeCalls(), 1);
+        assertEq(system.subscribeCalls(), 2);
+
+        guard.setDcaEnabled(false); // no change: no second unsubscribe
+        assertEq(system.unsubscribeCalls(), 1);
+
+        guard.setDcaEnabled(true);
+        assertEq(system.subscribeCalls(), 3); // cron re-subscribed
+        assertEq(system.unsubscribeCalls(), 1);
     }
 }

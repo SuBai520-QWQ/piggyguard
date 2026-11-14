@@ -61,13 +61,15 @@ contract PiggyGuardCallback is AbstractCallback {
     }
 
     /// @notice DCA tick: buy the risk asset with the vault's fixed DCA amount.
-    ///         The vault reads the price from the feed itself.
+    ///         The vault reads the price from the feed itself; the event
+    ///         carries the feed price seen at receipt time so off-chain
+    ///         parsers can reconcile the execution (fix-03, Perch P22).
     function executeDCA(address sender, uint256 actionId)
         external
         onlyServiceProvider
         onlyCallbackSender(sender)
     {
-        emit ActionReceived("dca", sender, 0, actionId);
+        emit ActionReceived("dca", sender, vault.priceFeed().latestPrice(), actionId);
         vault.executeDCA(actionId);
     }
 }

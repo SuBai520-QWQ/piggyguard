@@ -23,6 +23,10 @@ contract MockPriceFeed {
     uint256 public latestTimestamp;
 
     constructor(uint256 initialPrice_) {
+        // A zero initial price would poison every consumer from the start:
+        // the reactive contract would read it as a stop-loss crossing and
+        // every DCA would divide by (or skip on) zero (fix-03, Perch P13).
+        if (initialPrice_ == 0) revert ZeroPrice();
         owner = msg.sender;
         latestPrice = initialPrice_;
         latestTimestamp = block.timestamp;
