@@ -28,8 +28,11 @@ import { PiggyGuardCallback } from "./PiggyGuardCallback.sol";
 ///         while a genuine same-type replay is still ignored on the
 ///         destination chain. A failed callback request is caught and
 ///         reported via CallbackRequestFailed instead of reverting react()
-///         (Perch P3); the latch stays set, and the owner can re-arm the
-///         crossing with resetLatches() or setThresholds().
+///         (Perch P3); the latch is NOT set in that case (fix-04, Perch
+///         round-3 H1), so the next price event retries the crossing on
+///         its own, and the owner can additionally re-run the judgement
+///         at any time with forceCheck() or re-arm with resetLatches()
+///         or setThresholds().
 /// @dev Omni migration notes (verified against the official basic demo loop,
 ///      stage2 §8.7 — Sepolia event -> Lasna react() -> Sepolia callback):
 ///      - SYSTEM = 0x8888888888888888888888888888888888888888, react() guarded
@@ -167,6 +170,20 @@ contract PiggyGuardReactive is AbstractReactive {
         emit LatchesReset();
     }
 
+    /// @notice Re-run the price judgement once for an owner-supplied price,
+    ///         exactly as if a PriceUpdated log with that price had just
+    ///         arrived (fix-04, Perch round-3 H2). resetLatches() alone
+    ///         cannot recover a crossing when the feed then goes quiet —
+    ///         no new event means no new judgement — so the owner passes
+    ///         the last known price here to drive the judgement directly:
+    ///         a price still outside the band re-fires the action, a price
+    ///         back inside the band just clears the latches. The price is
+    ///         owner-supplied because this contract cannot read the
+    ///         origin-chain feed from Lasna.
+    function forceCheck(uint256 price_) external onlyOwner {
+        _onPrice(price_);
+    }
+
     function setDcaEnabled(bool enabled_) external onlyOwner {
         if (enabled_ == dcaEnabled) return;
         dcaEnabled = enabled_;
@@ -182,14 +199,19 @@ contract PiggyGuardReactive is AbstractReactive {
                 REACTIVE_IGNORE
             );
         } else {
-            SYSTEM.unsubscribe(
+            // Unsubscribing a subscription that is not active (e.g. the
+            // constructor's subscribe never landed) may revert on the real
+            // system contract; that must not brick the toggle, so the
+            // failure is swallowed here (fix-04, Perch round-3 M3). The
+            // flag above is the source of truth for whether DCA fires.
+            try SYSTEM.unsubscribe(
                 LASNA_CHAIN_ID,
                 CRON_CONTRACT,
                 cronTopic,
                 REACTIVE_IGNORE,
                 REACTIVE_IGNORE,
                 REACTIVE_IGNORE
-            );
+            ) { } catch { }
         }
         emit DcaToggled(enabled_);
     }
@@ -254,48 +276,73 @@ contract PiggyGuardReactive is AbstractReactive {
 
     /// @notice Request a stop-loss callback. The payload's first argument is
     ///         address(0) by design: the network injects this contract's
-    ///         address there for the callback contract to verify.
-    /// @return sent False when no callback destination is wired yet: the
-    ///         caller must NOT latch the crossing in that case (Perch P11).
+    ///         address there for the callback contract to verify. The
+    ///         payload also carries the current stopLoss threshold so the
+    ///         vault can re-check the condition at execution time and
+    ///         trade at the feed's then-current price (fix-04, C1/C2).
+    /// @return sent False when no callback destination is wired yet, or
+    ///         when the system contract rejected the request: the caller
+    ///         must NOT latch the crossing in either case (Perch P11,
+    ///         round-3 H1).
     function _requestStopLoss(uint256 price_) internal returns (bool sent) {
         // M12: until setCallback wires the destination, requests are dropped
         // silently — a callback to address(0) can never succeed, but every
         // react() that asks for one is still billed against the reserves.
         if (callback == address(0)) return false;
         uint256 actionId = ++actionCounter;
-        bytes memory payload =
-            abi.encodeCall(PiggyGuardCallback.executeStopLoss, (address(0), price_, actionId));
-        emit ActionRequested("stopLoss", actionId, price_, block.timestamp);
-        _sendCallback(actionId, payload);
-        return true;
+        bytes memory payload = abi.encodeCall(
+            PiggyGuardCallback.executeStopLoss, (address(0), price_, stopLoss, actionId)
+        );
+        sent = _sendCallback(actionId, payload);
+        // ActionRequested is emitted only once the request has really been
+        // handed to the network; on failure CallbackRequestFailed (inside
+        // _sendCallback) is the only event, so the log never claims a
+        // request that never left this contract (fix-04, round-3 L2).
+        if (sent) {
+            emit ActionRequested("stopLoss", actionId, price_, block.timestamp);
+        }
+        return sent;
     }
 
-    /// @notice Request a take-profit callback (same address(0) placeholder).
+    /// @notice Request a take-profit callback (same address(0) placeholder,
+    ///         carrying the current takeProfit threshold).
     function _requestTakeProfit(uint256 price_) internal returns (bool sent) {
         if (callback == address(0)) return false; // M12, see _requestStopLoss
         uint256 actionId = ++actionCounter;
-        bytes memory payload =
-            abi.encodeCall(PiggyGuardCallback.executeTakeProfit, (address(0), price_, actionId));
-        emit ActionRequested("takeProfit", actionId, price_, block.timestamp);
-        _sendCallback(actionId, payload);
-        return true;
+        bytes memory payload = abi.encodeCall(
+            PiggyGuardCallback.executeTakeProfit, (address(0), price_, takeProfit, actionId)
+        );
+        sent = _sendCallback(actionId, payload);
+        if (sent) {
+            emit ActionRequested("takeProfit", actionId, price_, block.timestamp);
+        }
+        return sent;
     }
 
     /// @notice Request a DCA callback. The vault reads the price from the
     ///         feed itself, so the payload carries no price.
-    function _requestDca() internal {
-        if (callback == address(0)) return; // M12, see _requestStopLoss
+    /// @return sent Same contract as _requestStopLoss; the Cron caller has
+    ///         no latch to set, but the return value keeps the three
+    ///         request paths uniform (fix-04, round-3 H1).
+    function _requestDca() internal returns (bool sent) {
+        if (callback == address(0)) return false; // M12, see _requestStopLoss
         uint256 actionId = ++actionCounter;
         bytes memory payload = abi.encodeCall(PiggyGuardCallback.executeDCA, (address(0), actionId));
-        emit ActionRequested("dca", actionId, 0, block.timestamp);
-        _sendCallback(actionId, payload);
+        sent = _sendCallback(actionId, payload);
+        if (sent) {
+            emit ActionRequested("dca", actionId, 0, block.timestamp);
+        }
+        return sent;
     }
 
     /// @dev A failed request must not revert react() (the network bills
     ///      reverted reactions anyway) and must not vanish silently either:
     ///      the failure is emitted as CallbackRequestFailed so the lost
     ///      action is observable and the owner can re-arm it (Perch P3).
-    function _sendCallback(uint256 actionId_, bytes memory payload_) internal {
+    /// @return sent True only when the system contract accepted the
+    ///         request. Callers latch a crossing only on true — "we tried"
+    ///         is not "it was sent" (fix-04, Perch round-3 H1).
+    function _sendCallback(uint256 actionId_, bytes memory payload_) internal returns (bool sent) {
         try SYSTEM.requestCallbackV_1_0(
             ISystemContract.CallbackConfiguration_V_1_0({
                 chainId: BASE_SEPOLIA_CHAIN_ID,
@@ -303,8 +350,11 @@ contract PiggyGuardReactive is AbstractReactive {
                 gasLimit: CALLBACK_GAS_LIMIT,
                 payload: payload_
             })
-        ) { } catch (bytes memory reason) {
+        ) {
+            return true;
+        } catch (bytes memory reason) {
             emit CallbackRequestFailed(actionId_, reason);
+            return false;
         }
     }
 }

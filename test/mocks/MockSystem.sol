@@ -27,6 +27,20 @@ contract MockSystem {
     address public lastRecipient;
     uint64 public lastGasLimit;
 
+    /// @notice Test switches: when set, the corresponding system call
+    ///         reverts, simulating e.g. an exhausted reactive reserve
+    ///         (fix-04 round-3 H1 / M3 tests).
+    bool public failCallbacks;
+    bool public failUnsubscribe;
+
+    function setFailCallbacks(bool fail_) external {
+        failCallbacks = fail_;
+    }
+
+    function setFailUnsubscribe(bool fail_) external {
+        failUnsubscribe = fail_;
+    }
+
     function subscribe(
         uint256 chainId_,
         address contract_,
@@ -49,12 +63,14 @@ contract MockSystem {
     }
 
     function unsubscribe(uint256, address, uint256, uint256, uint256, uint256) external {
+        if (failUnsubscribe) revert("MockSystem: unsubscribe failed");
         unsubscribeCalls++;
     }
 
     function requestCallbackV_1_0(ISystemContract.CallbackConfiguration_V_1_0 memory config_)
         external
     {
+        if (failCallbacks) revert("MockSystem: callback request failed");
         callbackRequests++;
         lastPayload = config_.payload;
         lastChainId = config_.chainId;

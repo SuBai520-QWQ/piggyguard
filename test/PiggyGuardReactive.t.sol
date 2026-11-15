@@ -123,15 +123,21 @@ contract PiggyGuardReactiveTest is Test {
         assertEq(bytes32(bytes4(system.lastPayload())), bytes32(selector_));
     }
 
-    function assertPricePayload(bytes4 selector_, uint256 expectedPrice_, uint256 expectedActionId)
-        internal
-        view
-    {
+    /// @dev fix-04: the payload now carries the band threshold as its third
+    ///      argument (sender, trigger price, threshold, actionId), so the
+    ///      vault can re-check the condition at execution time (C1/C2).
+    function assertPricePayload(
+        bytes4 selector_,
+        uint256 expectedPrice_,
+        uint256 expectedThreshold_,
+        uint256 expectedActionId
+    ) internal view {
         assertCallbackEnvelope(selector_);
-        (address sender, uint256 price, uint256 actionId) =
-            abi.decode(payloadArgs(system.lastPayload()), (address, uint256, uint256));
+        (address sender, uint256 price, uint256 threshold, uint256 actionId) =
+            abi.decode(payloadArgs(system.lastPayload()), (address, uint256, uint256, uint256));
         assertEq(sender, address(0)); // network-injected placeholder
         assertEq(price, expectedPrice_);
+        assertEq(threshold, expectedThreshold_);
         assertEq(actionId, expectedActionId);
     }
 
@@ -186,7 +192,7 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(priceLog(85_00000000)); // below $90 -> fires
         assertEq(system.callbackRequests(), 1);
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 1);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 90_00000000, 1);
 
         vm.prank(SYSTEM);
         guard.react(priceLog(80_00000000)); // still below -> must NOT fire again
@@ -207,7 +213,7 @@ contract PiggyGuardReactiveTest is Test {
         guard.react(priceLog(85_00000000)); // fires again after re-arm
         assertEq(countActions(), 1);
         assertEq(system.callbackRequests(), 2);
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 90_00000000, 2);
     }
 
     function testTakeProfitFiresAndClearsStopLossLatch() public {
@@ -220,7 +226,7 @@ contract PiggyGuardReactiveTest is Test {
         assertTrue(guard.takeProfitLatched());
         assertFalse(guard.stopLossLatched());
         assertEq(system.callbackRequests(), 2);
-        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 2);
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 120_00000000, 2);
     }
 
     function testInBandPriceDoesNothing() public {
@@ -344,7 +350,7 @@ contract PiggyGuardReactiveTest is Test {
         guard.react(priceLog(75_00000000)); // valid new crossing of $80
         assertEq(countActions(), 1);
         assertEq(system.callbackRequests(), 2);
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 75_00000000, 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 75_00000000, 80_00000000, 2);
     }
 
     // ---- M3: action ids are monotonic across all three actions ----
@@ -352,13 +358,13 @@ contract PiggyGuardReactiveTest is Test {
     function testActionIdsAreMonotonicAcrossActions() public {
         vm.prank(SYSTEM);
         guard.react(priceLog(85_00000000)); // stop-loss -> id 1
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 1);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 90_00000000, 1);
 
         vm.prank(SYSTEM);
         guard.react(priceLog(100_00000000)); // back in band
         vm.prank(SYSTEM);
         guard.react(priceLog(130_00000000)); // take-profit -> id 2
-        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 2);
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 120_00000000, 2);
 
         vm.prank(SYSTEM);
         guard.react(priceLog(100_00000000)); // back in band, DCA allowed again
@@ -468,7 +474,7 @@ contract PiggyGuardReactiveTest is Test {
         guard.react(priceLog(90_00000000)); // price == stopLoss: triggers (<=)
         assertTrue(guard.stopLossLatched());
         assertEq(system.callbackRequests(), 1);
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 90_00000000, 1);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 90_00000000, 90_00000000, 1);
     }
 
     function testTakeProfitTriggersAtExactThreshold() public {
@@ -476,7 +482,7 @@ contract PiggyGuardReactiveTest is Test {
         guard.react(priceLog(120_00000000)); // price == takeProfit: triggers (>=)
         assertTrue(guard.takeProfitLatched());
         assertEq(system.callbackRequests(), 1);
-        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 120_00000000, 1);
+        assertPricePayload(PiggyGuardCallback.executeTakeProfit.selector, 120_00000000, 120_00000000, 1);
     }
 
     // ---- fix-03 (Perch P8 / PG-N4): zero stop-loss is not a valid band ----
@@ -512,7 +518,7 @@ contract PiggyGuardReactiveTest is Test {
         vm.prank(SYSTEM);
         guard.react(priceLog(84_00000000)); // still below band: fires again
         assertEq(system.callbackRequests(), 2);
-        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 84_00000000, 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 84_00000000, 90_00000000, 2);
     }
 
     // ---- fix-03 (M2): disabling DCA unsubscribes the Cron ticks ----
@@ -529,5 +535,108 @@ contract PiggyGuardReactiveTest is Test {
         guard.setDcaEnabled(true);
         assertEq(system.subscribeCalls(), 3); // cron re-subscribed
         assertEq(system.unsubscribeCalls(), 1);
+    }
+
+    // ---- fix-04 (Perch round-3 M3): a failing unsubscribe must not -------
+    // ---- brick the DCA toggle -------------------------------------------
+
+    function testSetDcaEnabledSurvivesUnsubscribeFailure() public {
+        system.setFailUnsubscribe(true); // system contract rejects the call
+        guard.setDcaEnabled(false); // must NOT revert
+        assertFalse(guard.dcaEnabled()); // the flag still flipped
+        assertEq(system.unsubscribeCalls(), 0); // the call itself failed
+
+        system.setFailUnsubscribe(false);
+        guard.setDcaEnabled(true);
+        assertTrue(guard.dcaEnabled());
+    }
+
+    // ---- fix-04 (Perch round-3 H1): a failed callback request must -------
+    // ---- NOT latch the crossing ------------------------------------------
+
+    /// @notice Round-2 regression: _sendCallback swallowed the failure and
+    ///         _requestStopLoss still returned true, so the latch was set
+    ///         for a request that never left Lasna and the action was lost
+    ///         forever. Now the failure leaves the crossing armed and the
+    ///         next price event retries it. Also pins L2: no
+    ///         ActionRequested event is emitted for the failed attempt.
+    function testCallbackFailureDoesNotLatch() public {
+        system.setFailCallbacks(true); // e.g. reactive reserve exhausted
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // crossing seen, request fails
+        assertEq(countActions(), 0); // L2: no ActionRequested for a failure
+        assertEq(system.callbackRequests(), 0); // nothing was handed out
+        assertFalse(guard.stopLossLatched()); // H1: NOT latched
+
+        system.setFailCallbacks(false); // reserve topped up again
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(84_00000000)); // next event retries the crossing
+        assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 1);
+        assertTrue(guard.stopLossLatched());
+        // The failed attempt burned action id 1; the retry carries id 2.
+        assertPricePayload(
+            PiggyGuardCallback.executeStopLoss.selector, 84_00000000, 90_00000000, 2
+        );
+    }
+
+    // ---- fix-04 (Perch round-3 H2): forceCheck drives the judgement ------
+
+    /// @notice After resetLatches() a quiet feed produces no new event, so
+    ///         recovery used to stall. forceCheck re-runs the judgement
+    ///         with the owner-supplied last known price.
+    function testForceCheckRefiresAfterResetLatches() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // fires + latches
+        assertTrue(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 1);
+
+        guard.resetLatches();
+        assertFalse(guard.stopLossLatched());
+        // No new price log arrives. The owner drives the judgement with
+        // the last known price ($60, still below the line):
+        guard.forceCheck(60_00000000);
+        assertTrue(guard.stopLossLatched()); // crossing fired again
+        assertEq(system.callbackRequests(), 2);
+        assertPricePayload(
+            PiggyGuardCallback.executeStopLoss.selector, 60_00000000, 90_00000000, 2
+        );
+    }
+
+    function testForceCheckInBandPriceJustClearsLatches() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // latch set
+        assertTrue(guard.stopLossLatched());
+
+        guard.forceCheck(100_00000000); // back inside the band
+        assertFalse(guard.stopLossLatched());
+        assertFalse(guard.takeProfitLatched());
+        assertEq(system.callbackRequests(), 1); // no new request
+    }
+
+    function testForceCheckOnlyOwner() public {
+        vm.prank(address(0xBAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(PiggyGuardReactive.NotOwner.selector, address(0xBAD))
+        );
+        guard.forceCheck(60_00000000);
+    }
+
+    // ---- latch auto-clear when the condition disappears (round-3 item 2) -
+
+    /// @notice The in-band branch of _onPrice already re-arms both
+    ///         crossings; this pins the take-profit side explicitly (the
+    ///         stop-loss side is covered by testBandReturnRearmsBothCrossings).
+    function testTakeProfitLatchClearsWhenPriceReturnsInBand() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(130_00000000)); // take-profit fires + latches
+        assertTrue(guard.takeProfitLatched());
+
+        vm.prank(SYSTEM);
+        guard.react(priceLog(110_00000000)); // back below the line, in band
+        assertFalse(guard.takeProfitLatched());
+        assertEq(system.callbackRequests(), 1); // no extra request
     }
 }

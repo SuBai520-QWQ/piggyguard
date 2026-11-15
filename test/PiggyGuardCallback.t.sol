@@ -36,7 +36,7 @@ contract PiggyGuardCallbackTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(AbstractPayer.NotAuthorized.selector, address(this), PROXY)
         );
-        callback.executeStopLoss(REACTIVE, 80_00000000, 1);
+        callback.executeStopLoss(REACTIVE, 85_00000000, 90_00000000, 1);
     }
 
     function testWrongReactiveSenderRevertsForAllActions() public {
@@ -46,11 +46,11 @@ contract PiggyGuardCallbackTest is Test {
 
         vm.expectRevert(expected);
         vm.prank(PROXY);
-        callback.executeStopLoss(STRANGER, 80_00000000, 1);
+        callback.executeStopLoss(STRANGER, 85_00000000, 90_00000000, 1);
 
         vm.expectRevert(expected);
         vm.prank(PROXY);
-        callback.executeTakeProfit(STRANGER, 120_00000000, 1);
+        callback.executeTakeProfit(STRANGER, 115_00000000, 120_00000000, 1);
 
         vm.expectRevert(expected);
         vm.prank(PROXY);
@@ -60,8 +60,11 @@ contract PiggyGuardCallbackTest is Test {
     // ---- forwarding: each action really changes vault state ----
 
     function testStopLossForwardsToVault() public {
+        // fix-04: the vault executes at the feed's current price ($80),
+        // with the $90 threshold from the payload re-checked there.
+        feed.pushPrice(80_00000000);
         vm.prank(PROXY);
-        callback.executeStopLoss(REACTIVE, 80_00000000, 1);
+        callback.executeStopLoss(REACTIVE, 85_00000000, 90_00000000, 1);
 
         assertEq(vault.riskBalance(), 0);
         assertEq(vault.safeBalance(), 260_00000000); // 2 * $80 + $100
@@ -69,8 +72,9 @@ contract PiggyGuardCallbackTest is Test {
     }
 
     function testTakeProfitForwardsToVault() public {
+        feed.pushPrice(120_00000000); // condition holds at the feed price
         vm.prank(PROXY);
-        callback.executeTakeProfit(REACTIVE, 120_00000000, 1);
+        callback.executeTakeProfit(REACTIVE, 115_00000000, 120_00000000, 1);
 
         assertEq(vault.riskBalance(), 1_00000000); // sold 50%
         assertEq(vault.safeBalance(), 220_00000000); // 1 * $120 + $100
@@ -89,13 +93,14 @@ contract PiggyGuardCallbackTest is Test {
     // ---- M3 at the integration boundary ----
 
     function testReplayedCallbackIsIgnoredByVault() public {
+        feed.pushPrice(80_00000000);
         vm.prank(PROXY);
-        callback.executeStopLoss(REACTIVE, 80_00000000, 1);
+        callback.executeStopLoss(REACTIVE, 85_00000000, 90_00000000, 1);
         assertEq(vault.safeBalance(), 260_00000000);
 
         // Same payload delivered twice: the vault must not sell again.
         vm.prank(PROXY);
-        callback.executeStopLoss(REACTIVE, 80_00000000, 1);
+        callback.executeStopLoss(REACTIVE, 85_00000000, 90_00000000, 1);
         assertEq(vault.riskBalance(), 0);
         assertEq(vault.safeBalance(), 260_00000000);
         assertEq(vault.lastStopLossId(), 1);

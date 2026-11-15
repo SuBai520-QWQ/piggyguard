@@ -12,8 +12,8 @@ import { MockPriceFeed } from "./MockPriceFeed.sol";
 ///      - riskBalance: units of the risk asset, 8 decimals.
 ///      - safeBalance: units of the safe asset (USD-pegged), 8 decimals.
 ///      - price: USD per risk unit, 8 decimals (same convention as the feed).
-///      Execution is a virtual swap at the trigger price, so the demo never
-///      depends on a testnet DEX pool. The on-chain proof this project offers
+///      Execution is a virtual swap at the feed's current price, so the
+///      demo never depends on a testnet DEX pool. The on-chain proof this project offers
 ///      is the reactive loop itself (origin event -> Lasna react() -> callback),
 ///      not a real trade. A mock-ERC20 venue can replace this ledger later
 ///      without touching the reactive contract or the callback contract.
@@ -31,28 +31,43 @@ import { MockPriceFeed } from "./MockPriceFeed.sol";
 ///
 ///      Guard failures never revert (fix-03, Perch P3/P16): a reverting
 ///      callback is a permanently lost action, so "not now" conditions are
-///      reported as Skipped events instead. Prices are sanity-checked
-///      against the feed (Perch P5/P17): a trigger price that deviates from
-///      `priceFeed.latestPrice()` by more than MAX_PRICE_DEVIATION_BPS is
-///      skipped, never traded on.
+///      reported as Skipped events instead.
+///
+///      Execution price (fix-04, Perch round-3 C1/C2): stop-loss and
+///      take-profit trade at the feed's CURRENT price
+///      (`priceFeed.latestPrice()`), never at the payload's trigger price.
+///      The trigger price is one cross-chain hop old by the time the
+///      callback lands, so trading on it — or refusing to trade because it
+///      moved — are both wrong: a crash must still stop out (at the worse
+///      current price), and a recovery must not stop out at all. The
+///      payload therefore also carries the threshold the reactive contract
+///      used, and the vault re-checks the condition against the execution
+///      price: a stop-loss executes only while `execPrice <= stopLoss`,
+///      a take-profit only while `execPrice >= takeProfit`. The trigger
+///      price itself is kept for logs and Skipped events only.
 contract PiggyVault {
     uint256 public constant PRICE_SCALE = 1e8;
     /// @notice Take-profit sells this share of the risk position per trigger.
     uint256 public constant TAKE_PROFIT_BPS = 5000; // 50%
-    /// @notice Maximum allowed deviation between a callback's trigger price
-    ///         and the feed's latest price (20%). Beyond it the action is
-    ///         skipped: the price the reactive contract saw is too far from
-    ///         the price the vault can verify, so trading on it is unsafe.
+    /// @notice Band used by the DCA circuit breaker (20%): a tick whose
+    ///         feed price deviates from the reference price by more than
+    ///         this is treated as a possible level shift and must be
+    ///         confirmed (see DCA_CONFIRMATION_TICKS) before trading
+    ///         resumes at the new level.
     uint256 public constant MAX_PRICE_DEVIATION_BPS = 2000; // 20%
+    /// @notice Consecutive ticks that must cluster near a candidate price
+    ///         before the DCA circuit breaker adopts it as the new
+    ///         reference level (fix-04, Perch round-3 H3).
+    uint256 public constant DCA_CONFIRMATION_TICKS = 3;
 
     event Funded(string asset, uint256 amount);
     event Withdrawn(string asset, uint256 amount);
     event StopLossExecuted(uint256 actionId, uint256 price, uint256 sold, uint256 received);
     event TakeProfitExecuted(uint256 actionId, uint256 price, uint256 sold, uint256 received);
-    event StopLossSkipped(string reason, uint256 price);
-    event TakeProfitSkipped(string reason, uint256 price);
+    event StopLossSkipped(string reason, uint256 actionId, uint256 price);
+    event TakeProfitSkipped(string reason, uint256 actionId, uint256 price);
     event DcaExecuted(uint256 actionId, uint256 price, uint256 spent, uint256 bought);
-    event DcaSkipped(string reason, uint256 safeBalance);
+    event DcaSkipped(string reason, uint256 actionId, uint256 safeBalance);
     event ActionIgnored(uint256 actionId, uint256 lastActionId);
     event ExecutorUpdated(address indexed executor);
     event DcaAmountUpdated(uint256 amount);
@@ -83,13 +98,25 @@ contract PiggyVault {
     uint256 public lastStopLossId;
     uint256 public lastTakeProfitId;
     uint256 public lastDcaId;
-    /// @notice Reference price for the DCA circuit breaker: the feed price of
-    ///         the last evaluated DCA tick (0 before the first one). A tick
-    ///         whose feed price deviates from it by more than
-    ///         MAX_PRICE_DEVIATION_BPS is skipped once and re-baselines the
-    ///         reference, so a genuine level shift delays DCA by one tick
-    ///         instead of disabling it forever (review PG-N3 mitigation).
+    /// @notice Reference price for the DCA circuit breaker: the feed price
+    ///         of the last executed DCA tick (0 before the first one). A
+    ///         tick whose feed price deviates from it by more than
+    ///         MAX_PRICE_DEVIATION_BPS does NOT trade and does NOT move the
+    ///         reference; instead the tick's price becomes (or confirms) a
+    ///         candidate new level — see dcaCandidatePrice (fix-04, H3).
     uint256 public dcaReferencePrice;
+    /// @notice Candidate new level for the DCA circuit breaker: the first
+    ///         price seen far away from dcaReferencePrice. While a candidate
+    ///         is pending, ticks near the reference clear it (the jump was
+    ///         a spike) and ticks near the candidate confirm it.
+    uint256 public dcaCandidatePrice;
+    /// @notice How many consecutive ticks have clustered within
+    ///         MAX_PRICE_DEVIATION_BPS of dcaCandidatePrice. When the count
+    ///         reaches DCA_CONFIRMATION_TICKS the candidate is adopted as
+    ///         the new dcaReferencePrice and that tick trades; before that
+    ///         the ticks are skipped, so a single wild print can never
+    ///         re-baseline the breaker on its own (fix-04, H3).
+    uint256 public dcaCandidateCount;
     bool public paused;
 
     modifier onlyOwner() {
@@ -115,6 +142,9 @@ contract PiggyVault {
     // ---- owner: funding / config ----
 
     function fundRisk(uint256 amount_) external onlyOwner {
+        // A zero fund would emit a meaningless Funded event (Perch round-3
+        // L1); reject it like every other zero amount in this contract.
+        if (amount_ == 0) revert ZeroAmount();
         riskBalance += amount_;
         emit Funded("risk", amount_);
     }
@@ -125,6 +155,7 @@ contract PiggyVault {
     }
 
     function withdrawRisk(uint256 amount_) external onlyOwner {
+        if (amount_ == 0) revert ZeroAmount(); // Perch round-3 L1
         if (amount_ > riskBalance) revert InsufficientBalance(amount_, riskBalance);
         riskBalance -= amount_;
         emit Withdrawn("risk", amount_);
@@ -140,14 +171,29 @@ contract PiggyVault {
         // Zero is rejected: it would silently disable every automated action.
         // To pause execution instead, use pause().
         if (executor_ == address(0)) revert ZeroAddress();
+        // Re-setting the SAME executor (a misclick, or an attempt to
+        // "re-arm" the vault) must change nothing: resetting the watermarks
+        // here would make every already-executed id valid again, so a
+        // re-delivered take-profit would really sell a second time
+        // (fix-04, Perch round-3 H4).
+        if (executor_ == executor) {
+            emit ExecutorUpdated(executor_);
+            return;
+        }
         executor = executor_;
         // A fresh executor (e.g. a redeployed reactive + callback pair)
         // numbers its actions from 1 again. Resetting the watermarks keeps
         // those first actions from being misread as replays of the old
-        // executor's deliveries (Perch P4).
+        // executor's deliveries (Perch P4). The DCA breaker state belongs
+        // to the old executor's tick history too: a stale reference price
+        // (and a half-confirmed candidate) must not greet the new
+        // executor's first tick (fix-04, Perch round-3 H4).
         lastStopLossId = 0;
         lastTakeProfitId = 0;
         lastDcaId = 0;
+        dcaReferencePrice = 0;
+        dcaCandidatePrice = 0;
+        dcaCandidateCount = 0;
         emit ExecutorUpdated(executor_);
     }
 
@@ -169,95 +215,140 @@ contract PiggyVault {
 
     // ---- executor: the three automated actions ----
 
-    /// @notice Sell the entire risk position into the safe asset at `price_`.
+    /// @notice Sell the entire risk position into the safe asset.
+    /// @param triggerPrice_ The price the reactive contract saw when it
+    ///        ordered this stop-loss. Used for logs / Skipped events only:
+    ///        the trade itself executes at the feed's current price, and
+    ///        only if the stop-loss condition still holds at that price
+    ///        (fix-04, Perch round-3 C1/C2).
+    /// @param stopLossThreshold_ The stop-loss line from the reactive
+    ///        contract's band, carried in the payload so the vault can
+    ///        re-check the condition at execution time.
     /// @param actionId_ Id assigned by the reactive contract (one counter
     ///        shared by all action types). Replay protection is per type:
     ///        only a stop-loss delivery at or below `lastStopLossId` is
     ///        ignored; other action types never block a stop-loss.
-    function executeStopLoss(uint256 price_, uint256 actionId_) external onlyExecutor {
+    function executeStopLoss(uint256 triggerPrice_, uint256 stopLossThreshold_, uint256 actionId_)
+        external
+        onlyExecutor
+    {
         if (actionId_ <= lastStopLossId) {
             emit ActionIgnored(actionId_, lastStopLossId);
             return;
         }
         if (paused) {
-            emit StopLossSkipped("vault paused", price_);
+            emit StopLossSkipped("vault paused", actionId_, triggerPrice_);
             return;
         }
-        // A zero trigger price would sell the whole position for nothing
-        // (Perch P2 / review PG-N2). Skip, never trade.
-        if (price_ == 0) {
-            emit StopLossSkipped("zero price", price_);
+        uint256 execPrice = priceFeed.latestPrice();
+        // The feed itself can never hold zero (constructor and pushPrice
+        // reject it), but the vault still refuses to trade on a zero
+        // execution price — as a skip, not a revert (Perch P3).
+        if (execPrice == 0) {
+            emit StopLossSkipped("zero feed price", actionId_, triggerPrice_);
             return;
         }
-        if (_deviatesTooFar(price_, priceFeed.latestPrice())) {
-            emit StopLossSkipped("price deviates from feed", price_);
+        // Condition re-check at the execution price (fix-04, C2): if the
+        // price has recovered above the stop-loss line while the callback
+        // was in flight, the stop-loss no longer applies — selling here
+        // would exit a position the strategy wants to keep. Conversely a
+        // price that kept crashing still executes below, at execPrice:
+        // the stop-loss must work hardest exactly when the market moves
+        // most (fix-04, C1).
+        if (execPrice > stopLossThreshold_) {
+            emit StopLossSkipped("stop-loss condition no longer holds", actionId_, triggerPrice_);
             return;
         }
         uint256 sold = riskBalance;
         if (sold == 0) {
             // Nothing to sell: a zero-quantity "success" event would pollute
             // the evidence trail, so report the skip explicitly instead.
-            emit StopLossSkipped("no risk balance", price_);
+            emit StopLossSkipped("no risk balance", actionId_, triggerPrice_);
             return;
         }
         lastStopLossId = actionId_;
-        uint256 received = (sold * price_) / PRICE_SCALE;
+        uint256 received = (sold * execPrice) / PRICE_SCALE;
         riskBalance = 0;
         safeBalance += received;
-        emit StopLossExecuted(actionId_, price_, sold, received);
+        emit StopLossExecuted(actionId_, execPrice, sold, received);
     }
 
-    /// @notice Sell TAKE_PROFIT_BPS of the risk position at `price_`.
-    function executeTakeProfit(uint256 price_, uint256 actionId_) external onlyExecutor {
+    /// @notice Sell TAKE_PROFIT_BPS of the risk position. Like the
+    ///         stop-loss, the trade executes at the feed's current price
+    ///         and only if the take-profit condition still holds there
+    ///         (fix-04, Perch round-3 C1/C2).
+    /// @param triggerPrice_ Trigger observation, for logs only.
+    /// @param takeProfitThreshold_ The take-profit line from the reactive
+    ///        contract's band, carried in the payload for the re-check.
+    function executeTakeProfit(
+        uint256 triggerPrice_,
+        uint256 takeProfitThreshold_,
+        uint256 actionId_
+    ) external onlyExecutor {
         if (actionId_ <= lastTakeProfitId) {
             emit ActionIgnored(actionId_, lastTakeProfitId);
             return;
         }
         if (paused) {
-            emit TakeProfitSkipped("vault paused", price_);
+            emit TakeProfitSkipped("vault paused", actionId_, triggerPrice_);
             return;
         }
-        if (price_ == 0) {
-            emit TakeProfitSkipped("zero price", price_);
+        uint256 execPrice = priceFeed.latestPrice();
+        if (execPrice == 0) {
+            emit TakeProfitSkipped("zero feed price", actionId_, triggerPrice_);
             return;
         }
-        if (_deviatesTooFar(price_, priceFeed.latestPrice())) {
-            emit TakeProfitSkipped("price deviates from feed", price_);
+        // Condition re-check (fix-04, C2): a price that fell back below
+        // the take-profit line while the callback was in flight must not
+        // be sold as a "take-profit".
+        if (execPrice < takeProfitThreshold_) {
+            emit TakeProfitSkipped(
+                "take-profit condition no longer holds", actionId_, triggerPrice_
+            );
             return;
         }
         uint256 sold = (riskBalance * TAKE_PROFIT_BPS) / 10000;
         if (sold == 0) {
             if (riskBalance == 0) {
-                emit TakeProfitSkipped("no risk balance", price_);
+                emit TakeProfitSkipped("no risk balance", actionId_, triggerPrice_);
                 return;
             }
             // Dust position: 50% rounds down to zero. Sell the remainder
             // instead of skipping forever and locking the dust (Perch P18).
             sold = riskBalance;
         }
+        uint256 received = (sold * execPrice) / PRICE_SCALE;
+        // A sale that yields nothing must not clear the position: at a
+        // very low execution price the dust remainder rounds to zero
+        // proceeds, and zeroing the position for zero income would burn
+        // it (fix-04, Perch round-3 M6). Skip; the id stays usable.
+        if (received == 0) {
+            emit TakeProfitSkipped("proceeds would be zero", actionId_, triggerPrice_);
+            return;
+        }
         lastTakeProfitId = actionId_;
-        uint256 received = (sold * price_) / PRICE_SCALE;
         riskBalance -= sold;
         safeBalance += received;
-        emit TakeProfitExecuted(actionId_, price_, sold, received);
+        emit TakeProfitExecuted(actionId_, execPrice, sold, received);
     }
 
     /// @notice Spend `dcaAmount` of the safe asset to buy the risk asset at
     ///         the feed's latest price. Skips gracefully (no revert) when the
     ///         safe balance is too low, the vault is paused, or the feed
-    ///         price moved too far since the last tick, so a routine
-    ///         shortfall never fails a callback.
+    ///         price jumped far from the reference level and the jump has
+    ///         not been confirmed yet, so a routine shortfall never fails
+    ///         a callback.
     function executeDCA(uint256 actionId_) external onlyExecutor {
         if (actionId_ <= lastDcaId) {
             emit ActionIgnored(actionId_, lastDcaId);
             return;
         }
         if (paused) {
-            emit DcaSkipped("vault paused", safeBalance);
+            emit DcaSkipped("vault paused", actionId_, safeBalance);
             return;
         }
         if (safeBalance < dcaAmount) {
-            emit DcaSkipped("insufficient safe balance", safeBalance);
+            emit DcaSkipped("insufficient safe balance", actionId_, safeBalance);
             return;
         }
         uint256 price = priceFeed.latestPrice();
@@ -265,23 +356,48 @@ contract PiggyVault {
         // pushPrice), but the vault still refuses to divide by zero — as a
         // skip, not a revert, so the callback itself never fails (Perch P3).
         if (price == 0) {
-            emit DcaSkipped("zero price", safeBalance);
+            emit DcaSkipped("zero price", actionId_, safeBalance);
             return;
         }
-        // Circuit breaker (review PG-N3): the tick was requested one cross-
-        // chain hop ago; if the feed price has since jumped far away from
-        // the last evaluated tick, do not buy at the new level blind. Skip
-        // this tick and re-baseline, so trading resumes on the next tick.
+        // Circuit breaker (review PG-N3, redesigned in fix-04 per Perch
+        // round-3 H3): a tick far away from the reference level does NOT
+        // trade and does NOT move the reference — the old design
+        // re-baselined after a single skipped tick, which made the
+        // "breaker" a one-tick delay, not a protection. Now the far-away
+        // price becomes a candidate level: only when
+        // DCA_CONFIRMATION_TICKS consecutive ticks cluster within the
+        // deviation band of the candidate is the candidate adopted as the
+        // new reference, and the confirming tick itself trades at the new
+        // level. A tick back near the reference clears the candidate, so
+        // the confirming ticks must be consecutive.
         if (_deviatesTooFar(price, dcaReferencePrice)) {
-            dcaReferencePrice = price;
-            emit DcaSkipped("price moved too far since last DCA", safeBalance);
-            return;
+            if (dcaCandidatePrice != 0 && !_deviatesTooFar(price, dcaCandidatePrice)) {
+                dcaCandidateCount += 1;
+            } else {
+                // First far tick, or a tick far from the candidate too:
+                // (re)start the confirmation at this price.
+                dcaCandidatePrice = price;
+                dcaCandidateCount = 1;
+            }
+            if (dcaCandidateCount < DCA_CONFIRMATION_TICKS) {
+                emit DcaSkipped("price moved too far since last DCA", actionId_, safeBalance);
+                return;
+            }
+            // Confirmed level shift: adopt the candidate and fall through
+            // so this tick trades at the new level.
+            dcaReferencePrice = dcaCandidatePrice;
+            dcaCandidatePrice = 0;
+            dcaCandidateCount = 0;
+        } else {
+            // Back near the reference: any pending candidate was a spike.
+            dcaCandidatePrice = 0;
+            dcaCandidateCount = 0;
         }
         uint256 bought = (dcaAmount * PRICE_SCALE) / price;
         if (bought == 0) {
             // Extreme price: the fixed amount buys nothing after rounding.
             // Skip without charging — never spend the full amount for zero.
-            emit DcaSkipped("price too high: buys zero", safeBalance);
+            emit DcaSkipped("price too high: buys zero", actionId_, safeBalance);
             return;
         }
         lastDcaId = actionId_;

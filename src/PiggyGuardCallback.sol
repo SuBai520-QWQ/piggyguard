@@ -40,24 +40,30 @@ contract PiggyGuardCallback is AbstractCallback {
         vault = PiggyVault(vault_);
     }
 
-    /// @notice Stop-loss: sell the whole risk position at the trigger price.
-    function executeStopLoss(address sender, uint256 price, uint256 actionId)
+    /// @notice Stop-loss: sell the whole risk position. The payload carries
+    ///         the trigger price (for logs) and the stop-loss threshold, so
+    ///         the vault can re-check the condition and execute at the
+    ///         feed's current price (fix-04, Perch round-3 C1/C2).
+    function executeStopLoss(address sender, uint256 price, uint256 stopLossThreshold, uint256 actionId)
         external
         onlyServiceProvider
         onlyCallbackSender(sender)
     {
         emit ActionReceived("stopLoss", sender, price, actionId);
-        vault.executeStopLoss(price, actionId);
+        vault.executeStopLoss(price, stopLossThreshold, actionId);
     }
 
-    /// @notice Take-profit: sell half the risk position at the trigger price.
-    function executeTakeProfit(address sender, uint256 price, uint256 actionId)
-        external
-        onlyServiceProvider
-        onlyCallbackSender(sender)
-    {
+    /// @notice Take-profit: sell half the risk position. Same payload
+    ///         shape as the stop-loss: trigger price plus the take-profit
+    ///         threshold for the vault's execution-time re-check.
+    function executeTakeProfit(
+        address sender,
+        uint256 price,
+        uint256 takeProfitThreshold,
+        uint256 actionId
+    ) external onlyServiceProvider onlyCallbackSender(sender) {
         emit ActionReceived("takeProfit", sender, price, actionId);
-        vault.executeTakeProfit(price, actionId);
+        vault.executeTakeProfit(price, takeProfitThreshold, actionId);
     }
 
     /// @notice DCA tick: buy the risk asset with the vault's fixed DCA amount.
