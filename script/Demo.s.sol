@@ -13,7 +13,7 @@ import { PiggyVault } from "../src/PiggyVault.sol";
 ///         Run after DeployBase, DeployReactive, WireUpBase and WireUpReactive:
 ///           forge script script/Demo.s.sol:Demo \
 ///             --rpc-url $BASE_SEPOLIA_RPC --broadcast
-///         Required env vars: PRIVATE_KEY, VAULT, PRICE_FEED.
+///         Required env vars: PRIVATE_KEY, VAULT, PRICE_FEED, CALLBACK.
 ///         Optional: DEMO_RISK (default 2 units), DEMO_SAFE (default $100),
 ///         DEMO_PRICE (default $85).
 /// @dev Forge prints the broadcast table (one tx hash per call) directly above
@@ -24,6 +24,7 @@ contract Demo is Script {
         uint256 deployerKey = vm.envUint("PRIVATE_KEY");
         address vaultAddr = vm.envAddress("VAULT");
         address feedAddr = vm.envAddress("PRICE_FEED");
+        address expectedCallback = vm.envAddress("CALLBACK");
         uint256 riskAmount = vm.envOr("DEMO_RISK", uint256(2_00000000));
         uint256 safeAmount = vm.envOr("DEMO_SAFE", uint256(100_00000000));
         uint256 demoPrice = vm.envOr("DEMO_PRICE", uint256(85_00000000));
@@ -31,9 +32,29 @@ contract Demo is Script {
         PiggyVault vault = PiggyVault(vaultAddr);
         MockPriceFeed feed = MockPriceFeed(feedAddr);
 
+        address deployer = vm.addr(deployerKey);
+
+        // Wiring checks before any state change: funding a vault whose
+        // executor is not the callback we expect, or whose owner is not this
+        // key, produces a demo that looks seeded but can never be driven —
+        // and the failure surfaces minutes later on Lasna, not here.
+        require(
+            vault.executor() == expectedCallback,
+            "vault.executor() != CALLBACK: run WireUpBase first"
+        );
+        require(vault.owner() == deployer, "vault.owner() != the PRIVATE_KEY deployer");
+        require(feed.owner() == deployer, "feed.owner() != the PRIVATE_KEY deployer");
+        // 8-decimal fixed point, not dollars: a bare `85` would mean
+        // $0.00000085 and would never cross the stop-loss line.
+        require(
+            demoPrice >= 1e8,
+            "DEMO_PRICE must be >= 1e8 (8-decimal fixed point: 1e8 == $1.00)"
+        );
+
         console.log("== PiggyGuard demo seed (Base Sepolia) ==");
         console.log("MockPriceFeed:", feedAddr);
         console.log("PiggyVault:", vaultAddr);
+        console.log("deployer (must own vault + feed):", deployer);
         console.log("vault.executor (must be the callback):", vault.executor());
         console.log("tx 1: vault.fundRisk(amount)", riskAmount);
         console.log("tx 2: vault.fundSafe(amount)", safeAmount);

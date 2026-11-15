@@ -65,6 +65,7 @@ contract PiggyGuardReactive is AbstractReactive {
     event CallbackUpdated(address indexed callback);
     event ThresholdsUpdated(uint256 stopLoss, uint256 takeProfit);
     event DcaToggled(bool enabled);
+    event DcaUnsubscribeFailed(bytes reason);
     event LatchesReset();
 
     error NotOwner(address sender);
@@ -202,8 +203,10 @@ contract PiggyGuardReactive is AbstractReactive {
             // Unsubscribing a subscription that is not active (e.g. the
             // constructor's subscribe never landed) may revert on the real
             // system contract; that must not brick the toggle, so the
-            // failure is swallowed here (fix-04, Perch round-3 M3). The
-            // flag above is the source of truth for whether DCA fires.
+            // failure is caught here (fix-04, Perch round-3 M3). The flag
+            // above is the source of truth for whether DCA fires; a failed
+            // unsubscribe only means the per-tick billing continues, which
+            // must be observable rather than swallowed (batch A, item 7).
             try SYSTEM.unsubscribe(
                 LASNA_CHAIN_ID,
                 CRON_CONTRACT,
@@ -211,7 +214,9 @@ contract PiggyGuardReactive is AbstractReactive {
                 REACTIVE_IGNORE,
                 REACTIVE_IGNORE,
                 REACTIVE_IGNORE
-            ) { } catch { }
+            ) { } catch (bytes memory reason) {
+                emit DcaUnsubscribeFailed(reason);
+            }
         }
         emit DcaToggled(enabled_);
     }

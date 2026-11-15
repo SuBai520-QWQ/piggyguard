@@ -150,6 +150,9 @@ contract PiggyVault {
     }
 
     function fundSafe(uint256 amount_) external onlyOwner {
+        // Same zero guard as fundRisk: a zero fund emits a meaningless
+        // Funded event and hides a mistyped amount (batch A, item 5).
+        if (amount_ == 0) revert ZeroAmount();
         safeBalance += amount_;
         emit Funded("safe", amount_);
     }
@@ -162,6 +165,8 @@ contract PiggyVault {
     }
 
     function withdrawSafe(uint256 amount_) external onlyOwner {
+        // Same zero guard as withdrawRisk (batch A, item 5).
+        if (amount_ == 0) revert ZeroAmount();
         if (amount_ > safeBalance) revert InsufficientBalance(amount_, safeBalance);
         safeBalance -= amount_;
         emit Withdrawn("safe", amount_);
@@ -236,6 +241,15 @@ contract PiggyVault {
             emit ActionIgnored(actionId_, lastStopLossId);
             return;
         }
+        // Defence in depth (batch A, item 6): a zero threshold in the payload
+        // is a malformed request. With stopLoss == 0 the re-check below can
+        // never pass for a real price, so the action would be silently
+        // meaningless — name the reason instead of letting it read as
+        // "condition no longer holds".
+        if (stopLossThreshold_ == 0) {
+            emit StopLossSkipped("zero stop-loss threshold", actionId_, triggerPrice_);
+            return;
+        }
         if (paused) {
             emit StopLossSkipped("vault paused", actionId_, triggerPrice_);
             return;
@@ -266,8 +280,16 @@ contract PiggyVault {
             emit StopLossSkipped("no risk balance", actionId_, triggerPrice_);
             return;
         }
-        lastStopLossId = actionId_;
         uint256 received = (sold * execPrice) / PRICE_SCALE;
+        // A sale that yields nothing must not clear the position: at a very
+        // low execution price the whole position can round to zero proceeds,
+        // and zeroing it for zero income would burn it (mirror of the
+        // take-profit M6 guard, batch A item 4). Skip; the id stays usable.
+        if (received == 0) {
+            emit StopLossSkipped("proceeds would be zero", actionId_, triggerPrice_);
+            return;
+        }
+        lastStopLossId = actionId_;
         riskBalance = 0;
         safeBalance += received;
         emit StopLossExecuted(actionId_, execPrice, sold, received);
@@ -287,6 +309,13 @@ contract PiggyVault {
     ) external onlyExecutor {
         if (actionId_ <= lastTakeProfitId) {
             emit ActionIgnored(actionId_, lastTakeProfitId);
+            return;
+        }
+        // Defence in depth (batch A, item 6): a zero take-profit threshold
+        // can never be reached by a real price, so the re-check below would
+        // always skip with a misleading reason. Name it.
+        if (takeProfitThreshold_ == 0) {
+            emit TakeProfitSkipped("zero take-profit threshold", actionId_, triggerPrice_);
             return;
         }
         if (paused) {
