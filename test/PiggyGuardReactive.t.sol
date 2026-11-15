@@ -10,7 +10,8 @@ import { PiggyGuardReactive } from "../src/PiggyGuardReactive.sol";
 import { MockSystem } from "./mocks/MockSystem.sol";
 
 /// @notice Unit tests for the reactive decision logic (latches, band re-arm,
-///         Cron DCA, silent ignore of foreign logs).
+///         Cron DCA, silent ignore of foreign logs, and the fix-05 result-event
+///         confirmation / timeout re-arm pair).
 /// @dev The constructor's SYSTEM.subscribe calls target the real SYSTEM address
 ///      (0x8888...), which has no code on a local test chain — those calls
 ///      succeed silently. react() is invoked via vm.prank(SYSTEM) so the
@@ -23,6 +24,7 @@ import { MockSystem } from "./mocks/MockSystem.sol";
 contract PiggyGuardReactiveTest is Test {
     address constant SYSTEM = 0x8888888888888888888888888888888888888888;
     address constant CALLBACK = address(0xCA11BAC);
+    address constant VAULT = address(0xBEEF);
     address constant CRON_CONTRACT = 0x0000000000000000000000000000000000fffFfF;
 
     uint256 constant BASE_SEPOLIA_CHAIN_ID = 84532;
@@ -36,6 +38,15 @@ contract PiggyGuardReactiveTest is Test {
         0xa65f96fc951c35ead38878e0f0b7a3c744a6f5ccc1476b313353ce31712313ad;
 
     bytes32 constant ACTION_TOPIC = keccak256("ActionRequested(string,uint256,uint256,uint256)");
+
+    /// @notice Vault result topics (fix-05). Recomputed here rather than read
+    ///         from the contract so a drift between the two is a test failure.
+    bytes32 constant SL_EXECUTED_TOPIC =
+        keccak256("StopLossExecuted(uint256,uint256,uint256,uint256)");
+    bytes32 constant SL_SKIPPED_TOPIC = keccak256("StopLossSkipped(string,uint256,uint256)");
+    bytes32 constant TP_EXECUTED_TOPIC =
+        keccak256("TakeProfitExecuted(uint256,uint256,uint256,uint256)");
+    bytes32 constant TP_SKIPPED_TOPIC = keccak256("TakeProfitSkipped(string,uint256,uint256)");
 
     MockPriceFeed feed;
     PiggyGuardReactive guard;
@@ -89,6 +100,75 @@ contract PiggyGuardReactiveTest is Test {
             topic2: 0,
             topic3: 0,
             data: "",
+            blockNumber: 1,
+            opCode: 0,
+            blockHash: 0,
+            txHash: 0,
+            logIndex: 0
+        });
+    }
+
+    /// @dev Vault result log: StopLossExecuted(actionId, price, sold, received).
+    ///      actionId is the first data word.
+    function stopLossExecutedLog(
+        uint256 actionId_,
+        uint256 price_,
+        uint256 sold_,
+        uint256 received_
+    ) internal pure returns (IReactive.LogRecord memory) {
+        return IReactive.LogRecord({
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            contractAddress: VAULT,
+            topic0: uint256(SL_EXECUTED_TOPIC),
+            topic1: 0,
+            topic2: 0,
+            topic3: 0,
+            data: abi.encode(actionId_, price_, sold_, received_),
+            blockNumber: 1,
+            opCode: 0,
+            blockHash: 0,
+            txHash: 0,
+            logIndex: 0
+        });
+    }
+
+    /// @dev StopLossSkipped(reason, actionId, price): the string offset is the
+    ///      first data word, actionId the second — the reactive contract reads
+    ///      it from there instead of abi.decoding.
+    function stopLossSkippedLog(uint256 actionId_, uint256 price_)
+        internal
+        pure
+        returns (IReactive.LogRecord memory)
+    {
+        return IReactive.LogRecord({
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            contractAddress: VAULT,
+            topic0: uint256(SL_SKIPPED_TOPIC),
+            topic1: 0,
+            topic2: 0,
+            topic3: 0,
+            data: abi.encode("vault paused", actionId_, price_),
+            blockNumber: 1,
+            opCode: 0,
+            blockHash: 0,
+            txHash: 0,
+            logIndex: 0
+        });
+    }
+
+    function takeProfitSkippedLog(uint256 actionId_, uint256 price_)
+        internal
+        pure
+        returns (IReactive.LogRecord memory)
+    {
+        return IReactive.LogRecord({
+            chainId: BASE_SEPOLIA_CHAIN_ID,
+            contractAddress: VAULT,
+            topic0: uint256(TP_SKIPPED_TOPIC),
+            topic1: 0,
+            topic2: 0,
+            topic3: 0,
+            data: abi.encode("proceeds would be zero", actionId_, price_),
             blockNumber: 1,
             opCode: 0,
             blockHash: 0,
@@ -638,5 +718,402 @@ contract PiggyGuardReactiveTest is Test {
         guard.react(priceLog(110_00000000)); // back below the line, in band
         assertFalse(guard.takeProfitLatched());
         assertEq(system.callbackRequests(), 1); // no extra request
+    }
+
+    // =====================================================================
+    // fix-05 (Perch round-4 C1): result-event confirmation + timeout re-arm
+    // =====================================================================
+
+    // ---- layer 1: the vault result subscriptions ----
+
+    function testVaultResultSubscriptions() public {
+        guard.setVault(VAULT);
+        assertEq(system.subscribeCalls(), 6); // 2 constructor + 4 result topics
+
+        (
+            uint256 c2,
+            address a2,
+            uint256 t02,
+            uint256 t12,
+            uint256 t22,
+            uint256 t32
+        ) = system.subscriptions(2);
+        assertEq(c2, BASE_SEPOLIA_CHAIN_ID);
+        assertEq(a2, VAULT);
+        assertEq(t02, uint256(SL_EXECUTED_TOPIC));
+        assertEq(t12, REACTIVE_IGNORE);
+        assertEq(t22, REACTIVE_IGNORE);
+        assertEq(t32, REACTIVE_IGNORE);
+
+        (
+            uint256 c3,
+            address a3,
+            uint256 t03,
+            uint256 t13,
+            uint256 t23,
+            uint256 t33
+        ) = system.subscriptions(3);
+        assertEq(c3, BASE_SEPOLIA_CHAIN_ID);
+        assertEq(a3, VAULT);
+        assertEq(t03, uint256(SL_SKIPPED_TOPIC));
+        assertEq(t13, REACTIVE_IGNORE);
+        assertEq(t23, REACTIVE_IGNORE);
+        assertEq(t33, REACTIVE_IGNORE);
+
+        (
+            uint256 c4,
+            address a4,
+            uint256 t04,
+            uint256 t14,
+            uint256 t24,
+            uint256 t34
+        ) = system.subscriptions(4);
+        assertEq(c4, BASE_SEPOLIA_CHAIN_ID);
+        assertEq(a4, VAULT);
+        assertEq(t04, uint256(TP_EXECUTED_TOPIC));
+        assertEq(t14, REACTIVE_IGNORE);
+        assertEq(t24, REACTIVE_IGNORE);
+        assertEq(t34, REACTIVE_IGNORE);
+
+        (
+            uint256 c5,
+            address a5,
+            uint256 t05,
+            uint256 t15,
+            uint256 t25,
+            uint256 t35
+        ) = system.subscriptions(5);
+        assertEq(c5, BASE_SEPOLIA_CHAIN_ID);
+        assertEq(a5, VAULT);
+        assertEq(t05, uint256(TP_SKIPPED_TOPIC));
+        assertEq(t15, REACTIVE_IGNORE);
+        assertEq(t25, REACTIVE_IGNORE);
+        assertEq(t35, REACTIVE_IGNORE);
+    }
+
+    function testSetVaultIsIdempotentAndOwnerOnly() public {
+        guard.setVault(VAULT);
+        assertEq(system.subscribeCalls(), 6);
+        guard.setVault(VAULT); // same address: no double subscription
+        assertEq(system.subscribeCalls(), 6);
+
+        vm.prank(address(0xBAD));
+        vm.expectRevert(
+            abi.encodeWithSelector(PiggyGuardReactive.NotOwner.selector, address(0xBAD))
+        );
+        guard.setVault(address(0x1234));
+
+        vm.expectRevert(PiggyGuardReactive.ZeroAddress.selector);
+        guard.setVault(address(0));
+    }
+
+    // ---- layer 1: a result event clears the latch, never re-sends ----
+
+    /// @notice Brief test 2 (first half): a Skipped result releases the latch.
+    ///         The result itself must not produce a new request, and a repeat
+    ///         of the same price — condition still true — re-requests.
+    function testSkippedResultClearsLatchAndSamePriceRefires() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 1);
+        assertEq(guard.pendingStopLossId(), 1);
+
+        // The vault saw the request and skipped it (e.g. paused).
+        vm.prank(SYSTEM);
+        guard.react(stopLossSkippedLog(1, 85_00000000));
+        assertFalse(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 0);
+        assertEq(guard.stopLossLatchedAtBlock(), 0);
+        assertEq(system.callbackRequests(), 1); // the result never re-sends
+
+        // Same price pushed again: the condition still holds -> new request.
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 2);
+        assertTrue(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 2);
+        assertPricePayload(PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 90_00000000, 2);
+    }
+
+    /// @notice Brief test 2 (second half): after the Skipped result, a price
+    ///         back inside the band must not request anything.
+    function testSkippedResultClearsLatchAndInBandPriceDoesNotRefire() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        vm.prank(SYSTEM);
+        guard.react(stopLossSkippedLog(1, 85_00000000));
+        assertFalse(guard.stopLossLatched());
+
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000)); // back in band
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 1);
+        assertFalse(guard.stopLossLatched());
+    }
+
+    /// @notice Brief test 3: an Executed result releases the latch, produces
+    ///         no request of its own, and an in-band price afterwards stays
+    ///         silent — no double-fire.
+    function testExecutedResultClearsLatchWithoutRefire() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+
+        vm.prank(SYSTEM);
+        guard.react(stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000));
+        assertFalse(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 0);
+        assertEq(system.callbackRequests(), 1); // no auto-resend from the result
+
+        // Price back inside the band: nothing to do, nothing re-sent.
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000));
+        assertEq(countActions(), 0);
+        assertEq(system.callbackRequests(), 1);
+        assertFalse(guard.stopLossLatched());
+    }
+
+    /// @notice The take-profit side has the same layer-1 behaviour.
+    function testTakeProfitResultClearsLatch() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(130_00000000));
+        assertTrue(guard.takeProfitLatched());
+        assertEq(guard.pendingTakeProfitId(), 1);
+
+        vm.prank(SYSTEM);
+        guard.react(takeProfitSkippedLog(1, 130_00000000));
+        assertFalse(guard.takeProfitLatched());
+        assertEq(guard.pendingTakeProfitId(), 0);
+        assertEq(system.callbackRequests(), 1);
+    }
+
+    /// @notice A result for an OLDER request must not release a FRESH latch:
+    ///         otherwise the next price event would re-fire an action the
+    ///         vault already executed, and a second take-profit sells another
+    ///         50%.
+    function testStaleResultDoesNotClearFreshLatch() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // id 1
+        vm.prank(SYSTEM);
+        guard.react(priceLog(100_00000000)); // in band: latches cleared
+        vm.prank(SYSTEM);
+        guard.react(priceLog(84_00000000)); // id 2, latch set
+        assertEq(guard.pendingStopLossId(), 2);
+
+        // A late result for the OLD request (id 1) arrives now.
+        vm.prank(SYSTEM);
+        guard.react(stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000));
+        assertTrue(guard.stopLossLatched()); // still latched on id 2
+        assertEq(guard.pendingStopLossId(), 2);
+    }
+
+    /// @notice Result events are only trusted from the wired vault, on the
+    ///         origin chain. Before setVault, and from any other emitter,
+    ///         they are inert.
+    function testResultLogIgnoredBeforeVaultIsSet() public {
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+
+        vm.prank(SYSTEM);
+        guard.react(stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000));
+        assertTrue(guard.stopLossLatched()); // vault not wired: ignored
+    }
+
+    function testResultLogFromForeignContractIsIgnored() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+
+        IReactive.LogRecord memory log =
+            stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000);
+        log.contractAddress = address(0xDEAD); // right topic, wrong emitter
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertTrue(guard.stopLossLatched());
+    }
+
+    function testResultLogFromWrongChainIsIgnored() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+
+        IReactive.LogRecord memory log =
+            stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000);
+        log.chainId = LASNA_CHAIN_ID; // right emitter address, wrong chain
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertTrue(guard.stopLossLatched());
+    }
+
+    /// @notice A truncated payload must not revert react() (the actionId is
+    ///         read from raw data words, guarded by a length check).
+    function testTruncatedResultPayloadDoesNotRevert() public {
+        guard.setVault(VAULT);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+
+        IReactive.LogRecord memory log =
+            stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000);
+        log.data = hex"00"; // far too short to hold an actionId
+        vm.prank(SYSTEM);
+        guard.react(log); // must not revert
+        assertTrue(guard.stopLossLatched()); // and must not clear on garbage
+    }
+
+    // ---- layer 2: timeout re-arm on the Cron tick ----
+
+    /// @notice Brief test 1: the request was accepted, the delivery failed on
+    ///         Base (no result event ever arrives), >300 blocks pass and a
+    ///         Cron tick lands: the latch is released and the action is
+    ///         re-requested at the last observed price.
+    function testTimeoutRearmsAfterFailedDelivery() public {
+        guard.setVault(VAULT);
+        vm.roll(1000);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // id 1, latched at block 1000
+        assertTrue(guard.stopLossLatched());
+        assertEq(guard.stopLossLatchedAtBlock(), 1000);
+        assertEq(guard.pendingStopLossId(), 1);
+        assertEq(system.callbackRequests(), 1);
+
+        // No result event ever arrives: the callback never landed on Base.
+        // Advance strictly past the timeout, then deliver a Cron tick.
+        vm.roll(1000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+
+        // The stale latch was released and the action re-requested at the
+        // last observed price ($85, still below the $90 line), which
+        // re-latched on the new id.
+        assertEq(countActions(), 1); // exactly one re-request
+        assertEq(system.callbackRequests(), 2);
+        assertTrue(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 2);
+        assertEq(guard.stopLossLatchedAtBlock(), 1000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        assertPricePayload(
+            PiggyGuardCallback.executeStopLoss.selector, 85_00000000, 90_00000000, 2
+        );
+    }
+
+    /// @notice Brief test 4: inside the timeout window a Cron tick must not
+    ///         re-arm. Pins the boundary too: the check is strictly greater,
+    ///         so block.number == latchedAt + TIMEOUT is still "not yet".
+    function testCronWithinTimeoutDoesNotRearm() public {
+        guard.setVault(VAULT);
+        vm.roll(1000);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000));
+        assertTrue(guard.stopLossLatched());
+        assertEq(system.callbackRequests(), 1);
+
+        // Exactly at the boundary: not past the timeout.
+        vm.roll(1000 + guard.REARM_TIMEOUT_BLOCKS());
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+
+        assertEq(countActions(), 0); // no re-request
+        assertEq(system.callbackRequests(), 1);
+        assertTrue(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 1);
+        assertEq(guard.stopLossLatchedAtBlock(), 1000); // untouched
+    }
+
+    /// @notice The take-profit side has the same layer-2 behaviour.
+    function testTakeProfitTimeoutRearm() public {
+        guard.setVault(VAULT);
+        vm.roll(2000);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(130_00000000)); // id 1, TP latched at block 2000
+        assertTrue(guard.takeProfitLatched());
+        assertEq(guard.takeProfitLatchedAtBlock(), 2000);
+        assertEq(guard.pendingTakeProfitId(), 1);
+
+        vm.roll(2000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+
+        assertEq(countActions(), 1);
+        assertEq(system.callbackRequests(), 2);
+        assertTrue(guard.takeProfitLatched());
+        assertEq(guard.pendingTakeProfitId(), 2);
+        assertEq(guard.takeProfitLatchedAtBlock(), 2000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        assertPricePayload(
+            PiggyGuardCallback.executeTakeProfit.selector, 130_00000000, 120_00000000, 2
+        );
+    }
+
+    /// @notice A result event that lands before the timeout must prevent the
+    ///         re-arm. After a confirmed execution the Cron tick only does
+    ///         its DCA job: the stop-loss is not re-fired on its own, which
+    ///         is what keeps the design free of a resend loop.
+    function testResultBeforeTimeoutPreventsRearm() public {
+        guard.setVault(VAULT);
+        vm.roll(1000);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // id 1, latched
+        assertTrue(guard.stopLossLatched());
+
+        // The delivery landed and executed.
+        vm.prank(SYSTEM);
+        guard.react(stopLossExecutedLog(1, 85_00000000, 2_00000000, 170_00000000));
+        assertFalse(guard.stopLossLatched());
+        assertEq(guard.pendingStopLossId(), 0);
+
+        // Long after the timeout would have fired: the Cron tick finds no
+        // latch to re-arm and just buys.
+        vm.roll(1000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        IReactive.LogRecord memory log = cronLog();
+        vm.recordLogs();
+        vm.prank(SYSTEM);
+        guard.react(log);
+
+        assertEq(countActions(), 1); // the DCA request only
+        assertDcaPayload(2);
+        assertEq(system.callbackRequests(), 2); // stop-loss + DCA
+        assertFalse(guard.stopLossLatched());
+    }
+
+    /// @notice The re-arm is bounded to one attempt per Cron tick: a second
+    ///         tick immediately after a re-arm sees a fresh latch and leaves
+    ///         it alone (the retry rate is the Cron period, by construction).
+    function testRearmHappensAtMostOncePerCronTick() public {
+        guard.setVault(VAULT);
+        vm.roll(1000);
+        vm.prank(SYSTEM);
+        guard.react(priceLog(85_00000000)); // id 1
+        assertEq(system.callbackRequests(), 1);
+
+        vm.roll(1000 + guard.REARM_TIMEOUT_BLOCKS() + 1);
+        IReactive.LogRecord memory log = cronLog();
+        vm.prank(SYSTEM);
+        guard.react(log); // re-arm -> id 2
+        assertEq(system.callbackRequests(), 2);
+        assertEq(guard.pendingStopLossId(), 2);
+
+        // Next Cron tick, same block range: the latch is fresh, no re-arm.
+        vm.prank(SYSTEM);
+        guard.react(log);
+        assertEq(system.callbackRequests(), 2);
+        assertEq(guard.pendingStopLossId(), 2);
     }
 }

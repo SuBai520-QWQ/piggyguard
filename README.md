@@ -64,6 +64,8 @@ The vault is a **mock ledger**, not a real DEX trade: balances are ledger units 
 
 **Trust assumptions.** The price feed is single-owner and trusted by design (it is the demo's controlled price source); because the vault executes at the feed's own current price and re-checks the band condition there, a stale trigger price can no longer cause a wrong trade — but nothing can make an untrusted feed trustworthy: whoever controls the feed controls the execution price. Operationally, two wirings must be kept in sync by hand: changing the callback (`setCallback`) requires the matching `vault.setExecutor`, and the Cron contract address / topic follow plan §2.1 and are re-verified live on Lasna in stage 3.
 
+**Latch confirmation.** A latch is released by the vault's own result event (`StopLoss*` / `TakeProfit*` on Base Sepolia, matched on `actionId` so a late result cannot clear a fresh latch), or, if no result arrives, by the Cron tick once the latch is older than `REARM_TIMEOUT_BLOCKS` (300 Lasna blocks ≈ 3 Cron periods). The timeout re-arm rides on the Cron subscription, so with DCA disabled only result events and `forceCheck()` remain.
+
 ## Build & test
 
 ```bash
